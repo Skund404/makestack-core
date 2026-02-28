@@ -70,10 +70,10 @@ The App Layer CANNOT touch Git or SQLite. Only REST. This boundary is enforced b
 
 ## Tech Stack (This Repo)
 
-- **Language:** Go 1.22+
-- **Git operations:** go-git (github.com/go-git/go-git/v5)
-- **SQLite:** modernc.org/sqlite (pure Go, no CGO)
-- **HTTP router:** TBD (stdlib net/http or chi)
+- **Language:** Go 1.22.12 (installed at `~/go`)
+- **Git operations:** stdlib `os`/`filepath` for now; go-git deferred until write operations are needed
+- **SQLite:** modernc.org/sqlite v1.29.6 (pure Go, no CGO) ✓ in use
+- **HTTP router:** stdlib `net/http` (Go 1.22 method+path patterns) — decided, no chi needed
 - **JSON validation:** TBD
 - **Testing:** Go stdlib + testify if helpful
 - **Build:** Single binary, no runtime dependencies
@@ -232,18 +232,22 @@ The full specs are in the makestack-docs repo. Key documents for Core developmen
 
 ## Current State
 
-Core: NOT STARTED
-- [ ] Go module initialized
-- [ ] Project structure created
-- [ ] Git operations (read manifests from repo)
-- [ ] SQLite indexer (build index from Git)
-- [ ] REST API (serve primitives)
-- [ ] Full-text search (FTS5)
-- [ ] Relationship indexing + reverse lookups
+Core: **MVP WORKING** — binary builds, indexes fixtures, serves real JSON.
+
+- [x] Go module initialized (`github.com/makestack/makestack-core`)
+- [x] Project structure created
+- [x] Git operations — `internal/git`: walks data dir, reads all `manifest.json` files, parses typed fields, validates required fields, extracts relationships
+- [x] SQLite indexer — `internal/index`: full schema (primitives, relationships, FTS5), `UpsertFull` (atomic tx), `Delete`, `List`, `Get`, `Search`, `RelationshipsFor`, `RebuildFTS`
+- [x] REST API — `internal/api`: `GET /health`, `GET /api/primitives[?type=]`, `GET /api/primitives/{path...}`, `GET /api/search?q=`, `GET /api/relationships/{path...}`
+- [x] Full-text search (FTS5) — indexes name, description, tags, properties
+- [x] Relationship indexing + reverse lookups — `RelationshipsFor` returns both directions
+- [x] Test fixtures — one of each primitive type with cross-references, smoke-tested end-to-end
 - [ ] File watcher (re-index on change)
 - [ ] Authentication
 - [ ] Workshop support (scope queries by workshop)
 - [ ] JSON schema validation
+- [ ] go-git integration (write operations: commit manifests back to Git)
+- [ ] Tests (unit + integration)
 
 ---
 
@@ -255,40 +259,43 @@ Nothing currently in progress.
 
 ## What's Blocked / Known Issues
 
-- No blocking issues — ready to start building
+- **GOPATH warning:** `~/go` is both GOROOT and GOPATH. Harmless but noisy. Fix: add `export GOPATH=~/go/packages` (or any separate dir) to `~/.bashrc`.
+- **go-git not yet used:** The data reader uses stdlib `filepath.WalkDir`. go-git will be added when write operations (committing manifests) are needed.
+- **DB is in-memory by default:** Index is rebuilt from disk on every startup. Use `-db /path/to/index.db` for persistence across restarts.
 
 ---
 
 ## Next Steps (Priority Order)
 
-1. Initialize Go module, create project structure
-2. Build Git reader: walk a data directory, find all manifest.json files, parse them
-3. Build SQLite indexer: create tables, index all parsed manifests
-4. Build REST API: GET /primitives, GET /primitives/{path}, GET /search?q=
-5. Add relationship indexing with reverse lookups
-6. Add FTS5 search
-7. Add file watcher for incremental re-indexing
-8. Add workshop-scoped queries
-9. Add authentication
-10. Dockerize
+1. **File watcher** — `internal/watcher`: watch data dir, call `idx.UpsertFull` / `idx.Delete` on change, re-run `RebuildFTS`
+2. **Write API** — `POST /api/primitives`, `PUT /api/primitives/{path...}`, `DELETE /api/primitives/{path...}` — write JSON to disk and commit via go-git
+3. **go-git integration** — add go-git back to go.mod; implement `internal/git` commit/push/log operations
+4. **Authentication** — decide mechanism (API key simplest for v0), implement middleware
+5. **Workshop-scoped queries** — `GET /api/primitives?workshop=leatherwork`
+6. **JSON schema validation** — validate manifests on write against primitive type schemas
+7. **Tests** — unit tests for parser + indexer, integration tests against fixture data dir
+8. **Dockerize** — verify Dockerfile builds and runs correctly
 
 ---
 
 ## Decisions Made
 
-- Language: Go
-- Git library: go-git
-- SQLite library: modernc.org/sqlite (pure Go, no CGO)
+- Language: Go 1.22.12
+- Git library: go-git (deferred — not yet needed for read-only operation)
+- SQLite library: modernc.org/sqlite v1.29.6 (pure Go, no CGO)
+- HTTP router: stdlib `net/http` with Go 1.22 method+path patterns — no external router needed
 - Binary name: makestack-core
 - Default port: 8420
+- Default DB: `:memory:` (flag: `-db`)
 - License: MIT
 - Versioning: Semver from 0.1.0
+- Relationship direction: `RelationshipsFor` returns both source and target matches (bidirectional)
+- Manifest JSON stored verbatim in `primitives.manifest` column — no data loss
 
 ## Decisions Deferred
 
-- HTTP router: stdlib net/http vs chi (decide when building API)
-- REST vs GraphQL (REST default, reconsider if relationship queries are awkward)
-- Auth mechanism (JWT, API key, or session — decide when building auth)
+- REST vs GraphQL (REST default, reconsider if relationship queries become awkward)
+- Auth mechanism (API key simplest for v0; JWT or session for multi-user)
 
 ---
 
@@ -298,3 +305,14 @@ Nothing currently in progress.
 - Created nine spec documents defining the full architecture
 - Created this CLAUDE.md
 - Ready to start implementation
+
+### 2026-02-28 — MVP Implementation
+- Initialized Go module (`github.com/makestack/makestack-core`) and full project structure
+- Implemented `internal/git`: manifest reader, typed `ParsedManifest`, `Relationship`, `Parse()` with validation
+- Implemented `internal/index`: full SQLite schema, `UpsertFull` (atomic tx), `Delete`, `List`, `Get`, `Search` (FTS5), `RelationshipsFor`, `RebuildFTS`
+- Implemented `internal/api`: all four REST endpoints, typed response structs, `writeJSON`/`writeError` helpers
+- Wired `cmd/makestack-core/main.go`: reads → parses → indexes → FTS rebuild → HTTP server with graceful shutdown
+- Added test fixtures for all six primitive types with realistic cross-references
+- Installed Go 1.22.12, ran `go mod tidy`, confirmed clean build
+- Smoke-tested all endpoints against `test/fixtures/` — 8 primitives indexed, all endpoints return correct JSON
+- Decided on stdlib `net/http` (Go 1.22 patterns) — no external router needed
