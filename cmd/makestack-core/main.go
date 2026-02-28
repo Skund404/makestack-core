@@ -1,11 +1,10 @@
 // makestack-core is the headless data management engine for Makestack.
 // It reads manifest files from a Git data repository, builds a SQLite index,
-// and serves the data via a REST API.
+// serves data via a REST API, and watches the data directory for changes.
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
@@ -17,6 +16,7 @@ import (
 	"github.com/makestack/makestack-core/internal/api"
 	gitpkg "github.com/makestack/makestack-core/internal/git"
 	"github.com/makestack/makestack-core/internal/index"
+	"github.com/makestack/makestack-core/internal/watcher"
 )
 
 func main() {
@@ -40,7 +40,7 @@ func main() {
 	}
 	defer idx.Close()
 
-	// — Read all manifests from the data directory —————————————————————————
+	// — Bulk-load: read all manifests and index them ———————————————————————
 	reader, err := gitpkg.NewReader(*dataDir)
 	if err != nil {
 		log.Fatalf("create reader: %v", err)
@@ -52,7 +52,6 @@ func main() {
 	}
 	log.Printf("found %d manifest(s) in %s", len(manifests), *dataDir)
 
-	// — Parse and index every manifest ————————————————————————————————————
 	var indexed, skipped int
 	for _, m := range manifests {
 		pm, err := m.Parse()
@@ -61,11 +60,7 @@ func main() {
 			skipped++
 			continue
 		}
-
-		p := primitiveFromParsed(pm)
-		rels := relationshipsFromParsed(pm)
-
-		if err := idx.UpsertFull(ctx, p, rels); err != nil {
+		if err := idx.IndexManifest(ctx, pm); err != nil {
 			log.Printf("warning: index %s: %v", pm.Path, err)
 			skipped++
 			continue
@@ -74,12 +69,25 @@ func main() {
 	}
 	log.Printf("indexed %d primitive(s), skipped %d", indexed, skipped)
 
-	// — Rebuild FTS after bulk insert ————————————————————————————————————
+	// Rebuild FTS once after the bulk load for a clean, consistent index.
 	if err := idx.RebuildFTS(ctx); err != nil {
 		log.Printf("warning: rebuild FTS: %v", err)
 	}
 
-	// — Start HTTP server ————————————————————————————————————————————————
+	// — Start file watcher ——————————————————————————————————————————————————
+	w, err := watcher.New(*dataDir, idx)
+	if err != nil {
+		// Non-fatal: the server still works without live reloading.
+		log.Printf("warning: file watcher unavailable: %v", err)
+	} else {
+		go func() {
+			if err := w.Run(ctx); err != nil {
+				log.Printf("watcher: %v", err)
+			}
+		}()
+	}
+
+	// — Start HTTP server ————————————————————————————————————————————————————
 	srv := &http.Server{
 		Addr:         *addr,
 		Handler:      api.NewServer(idx),
@@ -104,53 +112,4 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
-}
-
-// primitiveFromParsed converts a git.ParsedManifest to the index.Primitive
-// type expected by the indexer.
-func primitiveFromParsed(pm *gitpkg.ParsedManifest) index.Primitive {
-	p := index.Primitive{
-		ID:            pm.ID,
-		Type:          pm.Type,
-		Name:          pm.Name,
-		Slug:          pm.Slug,
-		Path:          pm.Path,
-		Created:       pm.Created,
-		Modified:      pm.Modified,
-		Description:   pm.Description,
-		ClonedFrom:    pm.ClonedFrom,
-		ParentProject: pm.ParentProject,
-		Properties:    pm.Properties,
-		Manifest:      pm.Raw,
-	}
-
-	// Encode the []string tags slice as a JSON array for the index.
-	if len(pm.Tags) > 0 {
-		if b, err := json.Marshal(pm.Tags); err == nil {
-			p.Tags = json.RawMessage(b)
-		}
-	} else {
-		p.Tags = json.RawMessage("[]")
-	}
-
-	return p
-}
-
-// relationshipsFromParsed converts the relationships embedded in a parsed
-// manifest into the flat index.Relationship rows the indexer expects.
-func relationshipsFromParsed(pm *gitpkg.ParsedManifest) []index.Relationship {
-	if len(pm.Relationships) == 0 {
-		return nil
-	}
-	rels := make([]index.Relationship, len(pm.Relationships))
-	for i, r := range pm.Relationships {
-		rels[i] = index.Relationship{
-			SourcePath: pm.Path,
-			SourceType: pm.Type,
-			RelType:    r.Type,
-			TargetPath: r.Target,
-			Metadata:   r.Metadata,
-		}
-	}
-	return rels
 }

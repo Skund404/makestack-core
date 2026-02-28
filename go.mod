@@ -2,7 +2,10 @@ module github.com/makestack/makestack-core
 
 go 1.22
 
-require modernc.org/sqlite v1.29.6
+require (
+	github.com/fsnotify/fsnotify v1.9.0
+	modernc.org/sqlite v1.29.6
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

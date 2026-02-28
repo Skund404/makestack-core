@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 
+	gitpkg "github.com/makestack/makestack-core/internal/git"
 	_ "modernc.org/sqlite" // register the sqlite driver (pure Go, no CGO)
 )
 
@@ -291,6 +292,60 @@ func (idx *Index) RelationshipsFor(ctx context.Context, path string) ([]Relation
 	defer rows.Close()
 
 	return scanRelationships(rows)
+}
+
+// — manifest conversion ———————————————————————————————————————————————————————
+
+// IndexManifest converts a git.ParsedManifest to a Primitive and its
+// Relationships and calls UpsertFull atomically. It is the single shared
+// conversion used by both the initial bulk load and the file watcher.
+func (idx *Index) IndexManifest(ctx context.Context, pm *gitpkg.ParsedManifest) error {
+	return idx.UpsertFull(ctx, primitiveFrom(pm), relationshipsFrom(pm))
+}
+
+// primitiveFrom maps the typed fields of a ParsedManifest to an index Primitive.
+func primitiveFrom(pm *gitpkg.ParsedManifest) Primitive {
+	p := Primitive{
+		ID:            pm.ID,
+		Type:          pm.Type,
+		Name:          pm.Name,
+		Slug:          pm.Slug,
+		Path:          pm.Path,
+		Created:       pm.Created,
+		Modified:      pm.Modified,
+		Description:   pm.Description,
+		ClonedFrom:    pm.ClonedFrom,
+		ParentProject: pm.ParentProject,
+		Properties:    pm.Properties,
+		Manifest:      pm.Raw,
+	}
+	if len(pm.Tags) > 0 {
+		if b, err := json.Marshal(pm.Tags); err == nil {
+			p.Tags = json.RawMessage(b)
+		}
+	} else {
+		p.Tags = json.RawMessage("[]")
+	}
+	return p
+}
+
+// relationshipsFrom flattens the relationships embedded in a ParsedManifest
+// into the index.Relationship rows the indexer stores.
+func relationshipsFrom(pm *gitpkg.ParsedManifest) []Relationship {
+	if len(pm.Relationships) == 0 {
+		return nil
+	}
+	rels := make([]Relationship, len(pm.Relationships))
+	for i, r := range pm.Relationships {
+		rels[i] = Relationship{
+			SourcePath: pm.Path,
+			SourceType: pm.Type,
+			RelType:    r.Type,
+			TargetPath: r.Target,
+			Metadata:   r.Metadata,
+		}
+	}
+	return rels
 }
 
 // — scan helpers ——————————————————————————————————————————————————————————————
