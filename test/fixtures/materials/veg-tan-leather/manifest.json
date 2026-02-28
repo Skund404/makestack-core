@@ -1,0 +1,16 @@
+{
+  "id": "mat-veg-tan-leather-001",
+  "type": "material",
+  "name": "Veg-Tan Leather",
+  "slug": "veg-tan-leather",
+  "created": "2026-02-28T00:00:00Z",
+  "modified": "2026-02-28T00:00:00Z",
+  "description": "Vegetable-tanned cowhide at 3–4 oz weight. Suitable for tooling, carving, and hand-stitching.",
+  "tags": ["leather", "cowhide", "toolable", "natural-tan"],
+  "properties": {
+    "weight_oz": "3-4",
+    "finish": "natural",
+    "tanning": "vegetable",
+    "source": "Hermann Oak"
+  }
+}

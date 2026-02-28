@@ -1,0 +1,29 @@
+{
+  "id": "evt-leather-class-march-2026-001",
+  "type": "event",
+  "name": "Leatherworking Basics — March 2026",
+  "slug": "leather-class-march-2026",
+  "created": "2026-02-28T00:00:00Z",
+  "modified": "2026-02-28T00:00:00Z",
+  "description": "Two-hour introductory leatherworking class covering cutting, edge finishing, and saddle-stitching. Each attendee makes a simple card holder.",
+  "tags": ["leather", "class", "beginner", "community"],
+  "properties": {
+    "date": "2026-03-15",
+    "time": "14:00",
+    "duration_hours": 2,
+    "location": "Makerspace Workshop B",
+    "max_attendees": 8,
+    "registered": 5
+  },
+  "relationships": [
+    {
+      "type": "features_technique",
+      "target": "techniques/saddle-stitching/manifest.json"
+    },
+    {
+      "type": "uses_material",
+      "target": "materials/veg-tan-leather/manifest.json",
+      "metadata": { "notes": "Pre-cut kits provided per attendee" }
+    }
+  ]
+}

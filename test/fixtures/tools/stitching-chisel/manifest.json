@@ -1,0 +1,15 @@
+{
+  "id": "tool-stitching-chisel-001",
+  "type": "tool",
+  "name": "Stitching Chisel (4-prong)",
+  "slug": "stitching-chisel",
+  "created": "2026-02-28T00:00:00Z",
+  "modified": "2026-02-28T00:00:00Z",
+  "description": "A 4-prong stitching chisel for punching evenly spaced holes in leather before hand-stitching.",
+  "tags": ["leather", "stitching", "hand-tool"],
+  "properties": {
+    "prongs": 4,
+    "spacing_mm": 4,
+    "material": "carbon steel"
+  }
+}
