@@ -72,6 +72,7 @@ The App Layer CANNOT touch Git or SQLite. Only REST. This boundary is enforced b
 
 - **Language:** Go 1.22.12 (installed at `~/go`)
 - **Git operations:** stdlib `os`/`filepath` for now; go-git deferred until write operations are needed
+- **File watcher:** fsnotify v1.9.0 ✓ in use
 - **SQLite:** modernc.org/sqlite v1.29.6 (pure Go, no CGO) ✓ in use
 - **HTTP router:** stdlib `net/http` (Go 1.22 method+path patterns) — decided, no chi needed
 - **JSON validation:** TBD
@@ -242,7 +243,7 @@ Core: **MVP WORKING** — binary builds, indexes fixtures, serves real JSON.
 - [x] Full-text search (FTS5) — indexes name, description, tags, properties
 - [x] Relationship indexing + reverse lookups — `RelationshipsFor` returns both directions
 - [x] Test fixtures — one of each primitive type with cross-references, smoke-tested end-to-end
-- [ ] File watcher (re-index on change)
+- [x] File watcher — `internal/watcher`: fsnotify v1.9.0, recursive dir watching, 200 ms debounce, handles create/edit/delete live without restart
 - [ ] Authentication
 - [ ] Workshop support (scope queries by workshop)
 - [ ] JSON schema validation
@@ -267,8 +268,7 @@ Nothing currently in progress.
 
 ## Next Steps (Priority Order)
 
-1. **File watcher** — `internal/watcher`: watch data dir, call `idx.UpsertFull` / `idx.Delete` on change, re-run `RebuildFTS`
-2. **Write API** — `POST /api/primitives`, `PUT /api/primitives/{path...}`, `DELETE /api/primitives/{path...}` — write JSON to disk and commit via go-git
+1. **Write API** — `POST /api/primitives`, `PUT /api/primitives/{path...}`, `DELETE /api/primitives/{path...}` — write JSON to disk and commit via go-git
 3. **go-git integration** — add go-git back to go.mod; implement `internal/git` commit/push/log operations
 4. **Authentication** — decide mechanism (API key simplest for v0), implement middleware
 5. **Workshop-scoped queries** — `GET /api/primitives?workshop=leatherwork`
@@ -291,6 +291,10 @@ Nothing currently in progress.
 - Versioning: Semver from 0.1.0
 - Relationship direction: `RelationshipsFor` returns both source and target matches (bidirectional)
 - Manifest JSON stored verbatim in `primitives.manifest` column — no data loss
+- File watcher library: fsnotify v1.9.0
+- Watcher debounce: 200 ms (handles editor atomic-rename save patterns)
+- Watcher failure is non-fatal — server continues without live reload
+- `index.IndexManifest` is the single conversion point from `git.ParsedManifest` to index rows (used by both bulk loader and watcher)
 
 ## Decisions Deferred
 
@@ -305,6 +309,16 @@ Nothing currently in progress.
 - Created nine spec documents defining the full architecture
 - Created this CLAUDE.md
 - Ready to start implementation
+
+### 2026-02-28 — File Watcher
+- Implemented `internal/watcher` using fsnotify v1.9.0
+- Recursive directory watching: walks data dir on start, adds new dirs as they appear
+- 200 ms debounce to handle editor multi-event save patterns (truncate, write, chmod / write-temp-then-rename)
+- After debounce: reads file — exists → parse + upsert; missing → delete from index. No op inspection needed.
+- `RebuildFTS` called after each incremental change
+- Added `index.IndexManifest(ctx, *git.ParsedManifest)` as the shared conversion; main.go bulk loader and watcher both use it — no duplication
+- Watcher starts in goroutine after initial bulk load; failure is non-fatal
+- Verified end-to-end: create, edit, delete all reflected in API within ~200 ms with server running
 
 ### 2026-02-28 — MVP Implementation
 - Initialized Go module (`github.com/makestack/makestack-core`) and full project structure
