@@ -70,10 +70,11 @@ The App Layer CANNOT touch Git or SQLite. Only REST. This boundary is enforced b
 
 ## Tech Stack (This Repo)
 
-- **Language:** Go 1.22+
-- **Git operations:** go-git (github.com/go-git/go-git/v5)
-- **SQLite:** modernc.org/sqlite (pure Go, no CGO)
-- **HTTP router:** TBD (stdlib net/http or chi)
+- **Language:** Go 1.24 (go-git v5.17.0 requires 1.24)
+- **Git operations:** go-git v5.17.0 (github.com/go-git/go-git/v5)
+- **SQLite:** modernc.org/sqlite v1.29.6 (pure Go, no CGO)
+- **HTTP router:** stdlib net/http (Go 1.22 method+path patterns)
+- **File watcher:** fsnotify v1.9.0
 - **JSON validation:** TBD
 - **Testing:** Go stdlib + testify if helpful
 - **Build:** Single binary, no runtime dependencies
@@ -232,15 +233,17 @@ The full specs are in the makestack-docs repo. Key documents for Core developmen
 
 ## Current State
 
-Core: NOT STARTED
-- [ ] Go module initialized
-- [ ] Project structure created
-- [ ] Git operations (read manifests from repo)
-- [ ] SQLite indexer (build index from Git)
-- [ ] REST API (serve primitives)
-- [ ] Full-text search (FTS5)
-- [ ] Relationship indexing + reverse lookups
-- [ ] File watcher (re-index on change)
+Core: MVP COMPLETE — WRITE API DONE
+- [x] Go module initialized
+- [x] Project structure created
+- [x] Git operations: read manifests from repo (internal/git/git.go)
+- [x] Git operations: write + commit manifests (internal/git/writer.go — go-git)
+- [x] SQLite indexer: build index from Git (internal/index/index.go)
+- [x] REST API: GET /primitives, GET /primitives/{path}, GET /search?q= (internal/api/api.go)
+- [x] REST API: POST /primitives (create), PUT /primitives/{path} (update), DELETE /primitives/{path} (delete)
+- [x] Full-text search (FTS5)
+- [x] Relationship indexing + reverse lookups
+- [x] File watcher: re-index on change, debounced 200ms (internal/watcher/watcher.go)
 - [ ] Authentication
 - [ ] Workshop support (scope queries by workshop)
 - [ ] JSON schema validation
@@ -255,40 +258,38 @@ Nothing currently in progress.
 
 ## What's Blocked / Known Issues
 
-- No blocking issues — ready to start building
+- No blocking issues
 
 ---
 
 ## Next Steps (Priority Order)
 
-1. Initialize Go module, create project structure
-2. Build Git reader: walk a data directory, find all manifest.json files, parse them
-3. Build SQLite indexer: create tables, index all parsed manifests
-4. Build REST API: GET /primitives, GET /primitives/{path}, GET /search?q=
-5. Add relationship indexing with reverse lookups
-6. Add FTS5 search
-7. Add file watcher for incremental re-indexing
-8. Add workshop-scoped queries
-9. Add authentication
-10. Dockerize
+1. Authentication (API key for v0 — simplest that protects the write API)
+2. Workshop-scoped queries (`GET /api/primitives?workshop=leatherwork`)
+3. JSON schema validation on POST/PUT (validate against per-type schema)
+4. Unit + integration tests
+5. Dockerize
 
 ---
 
 ## Decisions Made
 
-- Language: Go
-- Git library: go-git
+- Language: Go 1.24 (go-git forced upgrade from 1.22)
+- Git library: go-git v5.17.0
 - SQLite library: modernc.org/sqlite (pure Go, no CGO)
+- HTTP router: stdlib net/http (Go 1.22 method+path routing is sufficient)
+- File watcher: fsnotify v1.9.0
 - Binary name: makestack-core
 - Default port: 8420
 - License: MIT
 - Versioning: Semver from 0.1.0
+- Write path: POST/PUT/DELETE write to Git and commit; watcher picks up change and updates index async
+- Workshop fixture format: `workshops/{slug}/workshop.json` (not manifest.json, so reader/watcher ignore it — read-only reference for now)
 
 ## Decisions Deferred
 
-- HTTP router: stdlib net/http vs chi (decide when building API)
 - REST vs GraphQL (REST default, reconsider if relationship queries are awkward)
-- Auth mechanism (JWT, API key, or session — decide when building auth)
+- Auth mechanism (JWT, API key, or session — decide when building auth; API key is likely v0)
 
 ---
 
@@ -298,3 +299,15 @@ Nothing currently in progress.
 - Created nine spec documents defining the full architecture
 - Created this CLAUDE.md
 - Ready to start implementation
+
+### 2026-02-28 — MVP + Write API
+- Initialized Go module, project structure, Dockerfile, README, CONTRIBUTING
+- Implemented internal/git/git.go: manifest reader, parser, ParsedManifest, Relationship
+- Implemented internal/index/index.go: full SQLite schema, FTS5, UpsertFull, Delete, List, Get, Search, RelationshipsFor, RebuildFTS, IndexManifest
+- Implemented internal/api/api.go: REST endpoints (read + write)
+- Implemented internal/watcher/watcher.go: fsnotify watcher, 200ms debounce, incremental index updates
+- Implemented internal/git/writer.go: go-git write/commit (WriteManifest, DeleteManifest)
+- Wired everything together in cmd/makestack-core/main.go
+- Added test fixtures for all 6 primitive types + workshop fixture
+- Fixed watcher to recursively watch/process new directories (race with write API)
+- All write endpoints verified: POST 201, PUT 200, DELETE 204; all commit to Git
