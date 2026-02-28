@@ -87,10 +87,19 @@ func main() {
 		}()
 	}
 
+	// — Open Git writer ———————————————————————————————————————————————————————
+	// Non-fatal: read-only endpoints still work without it; write endpoints
+	// will return 503 until the data directory is a valid git repository.
+	writer, err := gitpkg.NewWriter(*dataDir)
+	if err != nil {
+		log.Printf("warning: git writer unavailable: %v", err)
+		writer = nil
+	}
+
 	// — Start HTTP server ————————————————————————————————————————————————————
 	srv := &http.Server{
 		Addr:         *addr,
-		Handler:      api.NewServer(idx),
+		Handler:      api.NewServer(idx, writer),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,

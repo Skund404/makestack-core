@@ -107,13 +107,25 @@ func (w *Watcher) watchAllDirs() error {
 
 // handleEvent is called for every raw fsnotify event.
 func (w *Watcher) handleEvent(ctx context.Context, event fsnotify.Event) {
-	// When a new directory is created, start watching it immediately so
-	// we catch manifest files created inside it.
+	// When a new directory is created, recursively watch it and process any
+	// manifest.json files already inside it. The write API creates the entire
+	// directory tree in one shot (MkdirAll + WriteFile), so subdirectories and
+	// their files may already exist by the time the watcher fires for the parent.
 	if event.Has(fsnotify.Create) {
 		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-			if err := w.fw.Add(event.Name); err != nil {
-				log.Printf("watcher: watch new dir %s: %v", event.Name, err)
-			}
+			_ = filepath.WalkDir(event.Name, func(path string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return nil // skip unreadable entries
+				}
+				if d.IsDir() {
+					if addErr := w.fw.Add(path); addErr != nil {
+						log.Printf("watcher: watch new dir %s: %v", path, addErr)
+					}
+				} else if filepath.Base(path) == "manifest.json" {
+					w.process(ctx, path)
+				}
+				return nil
+			})
 			return
 		}
 	}
