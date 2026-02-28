@@ -1,0 +1,26 @@
+{
+  "id": "prj-zombie-wallet-v1-001",
+  "type": "project",
+  "name": "Zombie Wallet v1",
+  "slug": "zombie-wallet-v1",
+  "created": "2026-02-28T00:00:00Z",
+  "modified": "2026-02-28T00:00:00Z",
+  "description": "First attempt at a hand-stitched bifold wallet using natural veg-tan leather. Parent project containing sub-projects for each major component.",
+  "tags": ["leather", "wallet", "personal", "v1"],
+  "properties": {
+    "status": "in-progress",
+    "started": "2026-02-28",
+    "target_completion": "2026-03-07"
+  },
+  "relationships": [
+    {
+      "type": "uses_workflow",
+      "target": "workflows/bifold-wallet/manifest.json"
+    },
+    {
+      "type": "uses_material",
+      "target": "materials/veg-tan-leather/manifest.json",
+      "metadata": { "quantity": "1 sq ft" }
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "id": "tec-saddle-stitching-001",
+  "type": "technique",
+  "name": "Saddle Stitching",
+  "slug": "saddle-stitching",
+  "created": "2026-02-28T00:00:00Z",
+  "modified": "2026-02-28T00:00:00Z",
+  "description": "Hand-stitching method using two needles and waxed thread worked through pre-punched holes. Stronger than machine stitching because each stitch is independent.",
+  "tags": ["leather", "stitching", "hand-sewing", "beginner-friendly"],
+  "properties": {
+    "difficulty": "beginner",
+    "stitch_type": "lock",
+    "thread": "waxed linen or polyester"
+  },
+  "steps": [
+    "Mark stitch line with a wing divider set to 4 mm from the edge.",
+    "Punch holes along the stitch line with a 4-prong stitching chisel.",
+    "Cut a length of thread roughly 2.5× the stitch length.",
+    "Thread a needle on each end of the thread.",
+    "Push the first needle through hole 1; pull thread through to the midpoint.",
+    "Push the second needle through the same hole in the opposite direction, crossing the first thread.",
+    "Pull both ends tight and evenly, then repeat from step 5 for each hole.",
+    "Backstitch through the last 2 holes to lock, then trim and melt thread ends."
+  ],
+  "relationships": [
+    {
+      "type": "uses_tool",
+      "target": "tools/stitching-chisel/manifest.json"
+    }
+  ]
+}

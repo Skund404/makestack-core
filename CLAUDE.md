@@ -70,10 +70,10 @@ The App Layer CANNOT touch Git or SQLite. Only REST. This boundary is enforced b
 
 ## Tech Stack (This Repo)
 
-- **Language:** Go 1.24 (go-git v5.17.0 requires 1.24)
+- **Language:** Go 1.24 (go-git v5.17.0 requires 1.24; installed at `~/go`)
 - **Git operations:** go-git v5.17.0 (github.com/go-git/go-git/v5)
 - **SQLite:** modernc.org/sqlite v1.29.6 (pure Go, no CGO)
-- **HTTP router:** stdlib net/http (Go 1.22 method+path patterns)
+- **HTTP router:** stdlib `net/http` (Go 1.22 method+path patterns) — no chi needed
 - **File watcher:** fsnotify v1.9.0
 - **JSON validation:** TBD
 - **Testing:** Go stdlib + testify if helpful
@@ -234,19 +234,22 @@ The full specs are in the makestack-docs repo. Key documents for Core developmen
 ## Current State
 
 Core: MVP COMPLETE — WRITE API DONE
-- [x] Go module initialized
+
+- [x] Go module initialized (`github.com/makestack/makestack-core`)
 - [x] Project structure created
-- [x] Git operations: read manifests from repo (internal/git/git.go)
-- [x] Git operations: write + commit manifests (internal/git/writer.go — go-git)
-- [x] SQLite indexer: build index from Git (internal/index/index.go)
-- [x] REST API: GET /primitives, GET /primitives/{path}, GET /search?q= (internal/api/api.go)
-- [x] REST API: POST /primitives (create), PUT /primitives/{path} (update), DELETE /primitives/{path} (delete)
-- [x] Full-text search (FTS5)
-- [x] Relationship indexing + reverse lookups
-- [x] File watcher: re-index on change, debounced 200ms (internal/watcher/watcher.go)
+- [x] Git operations: read — `internal/git`: walks data dir, reads all `manifest.json` files, parses typed fields, validates required fields, extracts relationships
+- [x] Git operations: write — `internal/git/writer.go`: WriteManifest + DeleteManifest, auto-commits via go-git
+- [x] SQLite indexer — `internal/index`: full schema (primitives, relationships, FTS5), `UpsertFull` (atomic tx), `Delete`, `List`, `Get`, `Search`, `RelationshipsFor`, `RebuildFTS`
+- [x] REST API read — `GET /health`, `GET /api/primitives[?type=]`, `GET /api/primitives/{path...}`, `GET /api/search?q=`, `GET /api/relationships/{path...}`
+- [x] REST API write — `POST /api/primitives` (create, auto id/slug/timestamps), `PUT /api/primitives/{path...}` (update), `DELETE /api/primitives/{path...}` (delete)
+- [x] Full-text search (FTS5) — indexes name, description, tags, properties
+- [x] Relationship indexing + reverse lookups — `RelationshipsFor` returns both directions
+- [x] File watcher — `internal/watcher`: fsnotify v1.9.0, recursive dir watching, 200 ms debounce, handles create/edit/delete live; recursively processes new dirs to avoid race with write API
+- [x] Test fixtures — one of each primitive type + workshop fixture
 - [ ] Authentication
 - [ ] Workshop support (scope queries by workshop)
 - [ ] JSON schema validation
+- [ ] Tests (unit + integration)
 
 ---
 
@@ -258,7 +261,7 @@ Nothing currently in progress.
 
 ## What's Blocked / Known Issues
 
-- No blocking issues
+- **DB is in-memory by default:** Index is rebuilt from disk on every startup. Use `-db /path/to/index.db` for persistence across restarts.
 
 ---
 
@@ -274,22 +277,27 @@ Nothing currently in progress.
 
 ## Decisions Made
 
-- Language: Go 1.24 (go-git forced upgrade from 1.22)
+- Language: Go 1.24 (go-git v5.17.0 forced upgrade from 1.22)
 - Git library: go-git v5.17.0
-- SQLite library: modernc.org/sqlite (pure Go, no CGO)
-- HTTP router: stdlib net/http (Go 1.22 method+path routing is sufficient)
-- File watcher: fsnotify v1.9.0
+- SQLite library: modernc.org/sqlite v1.29.6 (pure Go, no CGO)
+- HTTP router: stdlib `net/http` with Go 1.22 method+path patterns — no external router needed
+- File watcher: fsnotify v1.9.0; watcher failure is non-fatal — server continues without live reload
 - Binary name: makestack-core
 - Default port: 8420
+- Default DB: `:memory:` (flag: `-db`)
 - License: MIT
 - Versioning: Semver from 0.1.0
+- Relationship direction: `RelationshipsFor` returns both source and target matches (bidirectional)
+- Manifest JSON stored verbatim in `primitives.manifest` column — no data loss
+- Watcher debounce: 200 ms (handles editor atomic-rename save patterns)
+- `index.IndexManifest` is the single conversion point from `git.ParsedManifest` to index rows (bulk loader and watcher both call it)
 - Write path: POST/PUT/DELETE write to Git and commit; watcher picks up change and updates index async
 - Workshop fixture format: `workshops/{slug}/workshop.json` (not manifest.json, so reader/watcher ignore it — read-only reference for now)
 
 ## Decisions Deferred
 
-- REST vs GraphQL (REST default, reconsider if relationship queries are awkward)
-- Auth mechanism (JWT, API key, or session — decide when building auth; API key is likely v0)
+- REST vs GraphQL (REST default, reconsider if relationship queries become awkward)
+- Auth mechanism (API key simplest for v0; JWT or session for multi-user)
 
 ---
 
@@ -300,14 +308,30 @@ Nothing currently in progress.
 - Created this CLAUDE.md
 - Ready to start implementation
 
-### 2026-02-28 — MVP + Write API
-- Initialized Go module, project structure, Dockerfile, README, CONTRIBUTING
-- Implemented internal/git/git.go: manifest reader, parser, ParsedManifest, Relationship
-- Implemented internal/index/index.go: full SQLite schema, FTS5, UpsertFull, Delete, List, Get, Search, RelationshipsFor, RebuildFTS, IndexManifest
-- Implemented internal/api/api.go: REST endpoints (read + write)
-- Implemented internal/watcher/watcher.go: fsnotify watcher, 200ms debounce, incremental index updates
-- Implemented internal/git/writer.go: go-git write/commit (WriteManifest, DeleteManifest)
-- Wired everything together in cmd/makestack-core/main.go
-- Added test fixtures for all 6 primitive types + workshop fixture
-- Fixed watcher to recursively watch/process new directories (race with write API)
-- All write endpoints verified: POST 201, PUT 200, DELETE 204; all commit to Git
+### 2026-02-28 — MVP Implementation
+- Initialized Go module (`github.com/makestack/makestack-core`) and full project structure
+- Implemented `internal/git`: manifest reader, typed `ParsedManifest`, `Relationship`, `Parse()` with validation
+- Implemented `internal/index`: full SQLite schema, `UpsertFull` (atomic tx), `Delete`, `List`, `Get`, `Search` (FTS5), `RelationshipsFor`, `RebuildFTS`
+- Implemented `internal/api`: all REST read endpoints, typed response structs, `writeJSON`/`writeError` helpers
+- Wired `cmd/makestack-core/main.go`: reads → parses → indexes → FTS rebuild → HTTP server with graceful shutdown
+- Added test fixtures for all six primitive types with realistic cross-references
+- Installed Go, ran `go mod tidy`, confirmed clean build
+- Smoke-tested all read endpoints against `test/fixtures/` — 8 primitives indexed, all endpoints return correct JSON
+- Decided on stdlib `net/http` (Go 1.22 patterns) — no external router needed
+
+### 2026-02-28 — File Watcher
+- Implemented `internal/watcher` using fsnotify v1.9.0
+- Recursive directory watching: walks data dir on start, adds new dirs as they appear
+- 200 ms debounce to handle editor multi-event save patterns
+- After debounce: reads file — exists → parse + upsert; missing → delete from index
+- `RebuildFTS` called after each incremental change
+- Added `index.IndexManifest(ctx, *git.ParsedManifest)` as the shared conversion
+
+### 2026-02-28 — Write API + go-git
+- Added go-git v5.17.0 (required go 1.24 upgrade in go.mod)
+- Implemented `internal/git/writer.go`: `Writer`, `WriteManifest`, `DeleteManifest` — auto-commits to git on every write
+- Rewrote `internal/api/api.go`: added POST/PUT/DELETE handlers, `writerReady()` guard (503 if nil), auto id/slug/timestamps on POST
+- Wired `git.Writer` into `main.go`; write endpoints return 503 if data dir is not a git repo
+- Fixed watcher `handleEvent` to recursively walk + process new directories (fixes race condition where write API creates dirs too fast for fsnotify)
+- Added `test/fixtures/workshops/leatherwork/workshop.json`
+- All write endpoints verified: POST 201 + auto fields, PUT 200, DELETE 204; all commit to Git; index updated via watcher ~200ms later

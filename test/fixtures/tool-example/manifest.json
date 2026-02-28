@@ -1,0 +1,14 @@
+{
+  "id": "tool-example-001",
+  "type": "tool",
+  "name": "Stitching Chisel",
+  "slug": "stitching-chisel",
+  "created": "2026-02-28T00:00:00Z",
+  "modified": "2026-02-28T00:00:00Z",
+  "description": "A 4-prong stitching chisel for leatherwork.",
+  "tags": ["leather", "stitching"],
+  "properties": {
+    "prongs": 4,
+    "spacing_mm": 4
+  }
+}

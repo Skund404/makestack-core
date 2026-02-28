@@ -1,0 +1,55 @@
+{
+  "id": "wfl-bifold-wallet-001",
+  "type": "workflow",
+  "name": "Bifold Wallet",
+  "slug": "bifold-wallet",
+  "created": "2026-02-28T00:00:00Z",
+  "modified": "2026-02-28T00:00:00Z",
+  "description": "Complete workflow for cutting, skiving, and stitching a simple bifold leather wallet with two card pockets.",
+  "tags": ["leather", "wallet", "beginner", "hand-stitched"],
+  "properties": {
+    "estimated_time_hours": 3,
+    "skill_level": "beginner",
+    "output": "bifold wallet"
+  },
+  "steps": [
+    {
+      "order": 1,
+      "name": "Transfer and cut",
+      "notes": "Transfer pattern to flesh side of leather. Cut outer panel and two card pocket pieces."
+    },
+    {
+      "order": 2,
+      "name": "Skive edges",
+      "notes": "Skive the top edge of each card pocket to reduce bulk before stitching."
+    },
+    {
+      "order": 3,
+      "name": "Stitch card pockets",
+      "technique": "techniques/saddle-stitching/manifest.json",
+      "notes": "Saddle-stitch each card pocket to the outer panel before folding."
+    },
+    {
+      "order": 4,
+      "name": "Assemble and stitch perimeter",
+      "technique": "techniques/saddle-stitching/manifest.json",
+      "notes": "Fold outer panel in half and saddle-stitch the three open sides."
+    },
+    {
+      "order": 5,
+      "name": "Finish edges",
+      "notes": "Bevel edges, apply edge paint or gum tragacanth, and burnish."
+    }
+  ],
+  "relationships": [
+    {
+      "type": "uses_technique",
+      "target": "techniques/saddle-stitching/manifest.json"
+    },
+    {
+      "type": "uses_material",
+      "target": "materials/veg-tan-leather/manifest.json",
+      "metadata": { "quantity": "1 sq ft", "notes": "3–4 oz weight" }
+    }
+  ]
+}
