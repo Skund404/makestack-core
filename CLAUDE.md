@@ -252,7 +252,7 @@ Core: **FEATURE COMPLETE FOR v0**
 - [x] Git operations: read — `internal/git`: walks data dir, reads all `manifest.json` files, parses typed fields, validates required fields, extracts relationships
 - [x] Git operations: write — `internal/git/writer.go`: WriteManifest + DeleteManifest, auto-commits via go-git
 - [x] SQLite indexer — `internal/index`: full schema (primitives, relationships, FTS5), `UpsertFull` (atomic tx), `Delete`, `List`, `Get`, `Search`, `RelationshipsFor`, `RebuildFTS`
-- [x] REST API read — `GET /health`, `GET /api/primitives[?type=]`, `GET /api/primitives/{path...}`, `GET /api/search?q=`, `GET /api/relationships/{path...}`
+- [x] REST API read — `GET /health`, `GET /api/primitives[?type=]`, `GET /api/primitives/{path...}[?at={hash}]`, `GET /api/primitives/{path...}/hash`, `GET /api/search?q=`, `GET /api/relationships/{path...}`
 - [x] REST API write — `POST /api/primitives` (create, auto id/slug/timestamps), `PUT /api/primitives/{path...}` (update), `DELETE /api/primitives/{path...}` (delete)
 - [x] Full-text search (FTS5) — indexes name, description, tags, properties
 - [x] Relationship indexing + reverse lookups — `RelationshipsFor` returns both directions
@@ -305,6 +305,8 @@ Nothing currently in progress.
 - Workshops moved to Shell — Core serves flat, unscoped catalogue only; no workshop tables in SQLite
 - Core has no concept of users, ownership, or personal state
 - Shell is the only client of Core; modules never talk to Core directly
+- Version-specific reads: `?at={hash}` reads directly from Git object store (bypasses SQLite); `/hash` sub-resource returns HEAD hash for Shell to pin inventory records; both return 503 when writer is nil
+- Go 1.22 mux `{path...}/suffix` limitation: detected via `strings.HasSuffix` inside the wildcard handler — safe because all primitive paths end with `/manifest.json`
 
 ## Decisions Deferred
 
@@ -380,3 +382,12 @@ Nothing currently in progress.
 - Fixed Dockerfile: `golang:1.22-alpine` → `golang:1.24-alpine`
 - Added comprehensive test suite: `internal/git/git_test.go`, `internal/index/index_test.go`, `internal/schema/schema_test.go`, `internal/api/api_test.go`; all pass (`go test ./...`)
 - Core is feature-complete for v0
+
+### 2026-03-01 — Version-Specific Primitive Retrieval
+- Added `internal/git/history.go`: `ReadManifestAtCommit(path, commitHash)` reads a manifest from the Git object store at any past commit; `HeadHash()` returns the current HEAD hash as a 40-char hex string; `ErrNotFound` sentinel (wraps `plumbing.ErrObjectNotFound` / `object.ErrFileNotFound`) so callers don't import go-git plumbing packages
+- Added `GET /api/primitives/{path...}?at={commit_hash}`: reads primitive from Git at a specific commit, bypasses SQLite index; response includes `commit_hash` field; 404 for unknown commit or path, 503 if data dir is not a git repo
+- Added `GET /api/primitives/{path...}/hash`: validates primitive exists in index, returns current HEAD hash as `{"commit_hash":"..."}` — Shell stores this when adding catalogue entry to inventory; 503 if not a git repo, 404 if unknown path
+- `/hash` suffix routing: Go 1.22 mux does not support `{path...}/suffix` patterns; detected via `strings.HasSuffix` inside `handleGetPrimitive` — safe because all valid paths end with `/manifest.json`
+- `internal/git/history_test.go`: 7 unit tests covering HeadHash and ReadManifestAtCommit (round-trip, versioned reads, not-found cases)
+- `internal/api/api_test.go`: 7 integration tests via `newGitTestServer` helper (temp git repo + committed fixture + in-memory index + real Writer); covers all success and error paths
+- `go test -race ./...` — all packages pass
