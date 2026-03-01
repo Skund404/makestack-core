@@ -39,32 +39,52 @@ It does NOT contain business logic, UI, modules, or rendering opinions. Those be
 
 ## Architecture
 
-Two independent systems communicating via REST:
+Three named layers:
+
+- **Catalogue** = This repo (makestack-core). Impersonal, canonical knowledge. No user state, no ownership.
+- **Shell** = makestack-app (separate repo, not yet built). Host application: React frontend + Python/FastAPI backend. Owns UserDB, module registry, auth, routing, keyword renderers, theme system. The Shell is the **only** client of Core. Modules never talk to Core directly.
+- **Inventory** = A concept in the Shell's UserDB, extended by modules. A user's personal relationship to the catalogue (what they own, how much, what they paid). References catalogue entries, never copies them.
 
 ```
-┌─────────────────────────────┐
-│   THIS REPO: CORE (Go)     │
-│                             │
-│   • Git read/write (go-git) │
-│   • SQLite index (modernc)  │
-│   • JSON schema validation  │
-│   • REST API                │
-│   • Auth                    │
-│   • File watcher            │
-└──────────────┬──────────────┘
-               │ REST API (JSON over HTTP)
-┌──────────────▼──────────────┐
-│   SEPARATE REPO: APP LAYER  │
-│   (Python + React)          │
-│                             │
-│   • Business logic          │
-│   • UI rendering            │
-│   • Module system           │
-│   • Keyword processing      │
-└─────────────────────────────┘
+┌─────────────────────────────────┐
+│   THIS REPO: CORE (Go)         │
+│   = THE CATALOGUE               │
+│                                 │
+│   Impersonal documented knowledge│
+│   No user state, no ownership   │
+│   • Git read/write (go-git)     │
+│   • SQLite read index (modernc) │
+│   • JSON schema validation      │
+│   • REST API                    │
+│   • File watcher                │
+└───────────────┬─────────────────┘
+                │ REST API (JSON over HTTP)
+                │ (Shell is the ONLY client)
+┌───────────────▼─────────────────┐
+│   SEPARATE REPO: SHELL          │
+│   (Python + React)              │
+│                                 │
+│   • Proxy to Core               │
+│   • UserDB (personal state)     │
+│   • Module registry             │
+│   • Authentication              │
+│   • Routing & navigation        │
+│   • Keyword renderer registry   │
+│   • Theme system                │
+│   • Settings                    │
+│                                 │
+│   Modules extend the Shell:     │
+│   • Inventory (what you own)    │
+│   • Cost tracking               │
+│   • Suppliers, CNC, etc.        │
+└─────────────────────────────────┘
 ```
 
-The App Layer CANNOT touch Git or SQLite. Only REST. This boundary is enforced by architecture.
+**Rules:**
+- The catalogue never knows about the user
+- The inventory never stores what the catalogue already knows
+- Uninstall every module → the catalogue still works fully
+- Shell is the only client of Core; modules never talk to Core directly
 
 ---
 
@@ -94,19 +114,12 @@ Six primitives stored as JSON files in Git:
 | Project | Concrete instances of making (recursive — can contain child projects) |
 | Event | Time-bound occurrences within projects |
 
-**Workshops** are organizational scopes (lenses) above primitives. They reference global primitives — they don't contain copies. Removing from a workshop ≠ deleting from Git.
+Workshops (personal organizational lenses) belong in the Shell's UserDB, not in the catalogue. The catalogue serves a flat, unscoped list of primitives.
 
 ### Directory Structure (Data Repo)
 
 ```
 makestack-data/
-├── .makestack/
-│   ├── config.json
-│   ├── themes/
-│   └── modules/
-├── workshops/
-│   ├── leatherwork/workshop.json
-│   └── cosplay/workshop.json
 ├── projects/
 │   └── {slug}/manifest.json
 ├── techniques/
@@ -117,9 +130,8 @@ makestack-data/
 │   └── {slug}/manifest.json
 ├── workflows/
 │   └── {slug}/manifest.json
-├── events/
-│   └── {slug}/manifest.json
-└── templates/
+└── events/
+    └── {slug}/manifest.json
 ```
 
 ### SQLite Index Schema
@@ -233,7 +245,7 @@ The full specs are in the makestack-docs repo. Key documents for Core developmen
 
 ## Current State
 
-Core: MVP COMPLETE — SCHEMA VALIDATION DONE
+Core: **FEATURE COMPLETE FOR v0**
 
 - [x] Go module initialized (`github.com/makestack/makestack-core`)
 - [x] Project structure created
@@ -245,11 +257,11 @@ Core: MVP COMPLETE — SCHEMA VALIDATION DONE
 - [x] Full-text search (FTS5) — indexes name, description, tags, properties
 - [x] Relationship indexing + reverse lookups — `RelationshipsFor` returns both directions
 - [x] File watcher — `internal/watcher`: fsnotify v1.9.0, recursive dir watching, 200 ms debounce, handles create/edit/delete live; recursively processes new dirs to avoid race with write API
-- [x] Test fixtures — one of each primitive type + workshop fixture
+- [x] Test fixtures — one of each primitive type
 - [x] Authentication — API key via `--api-key` flag or `MAKESTACK_API_KEY` env var; `--public-reads` makes GET endpoints open; constant-time comparison; `/health` always public
-- [x] Workshop support — `GET /api/primitives?workshop=<slug>[&type=<t>]`; workshops indexed from `workshops/*/workshop.json` at startup into SQLite `workshops` + `workshop_members` tables
+- [x] Workshop support — REMOVED; workshops are personal lenses, belong in Shell's UserDB
 - [x] JSON schema validation — `internal/schema`: structural type checks on POST/PUT; common (description/tags/relationships) + type-specific (steps, parent_project); all errors returned at once; 400 on failure
-- [ ] Tests (unit + integration)
+- [x] Tests — `internal/git`, `internal/index`, `internal/schema`, `internal/api` all covered; 100% pass
 
 ---
 
@@ -267,8 +279,8 @@ Nothing currently in progress.
 
 ## Next Steps (Priority Order)
 
-1. Unit + integration tests
-2. Dockerize
+1. Update Dockerfile (Go 1.24 already done) and verify Docker build
+2. Core is feature-complete for v0 — next work moves to makestack-app (Shell)
 
 ---
 
@@ -289,9 +301,10 @@ Nothing currently in progress.
 - Watcher debounce: 200 ms (handles editor atomic-rename save patterns)
 - `index.IndexManifest` is the single conversion point from `git.ParsedManifest` to index rows (bulk loader and watcher both call it)
 - Write path: POST/PUT/DELETE write to Git and commit; watcher picks up change and updates index async
-- Workshop fixture format: `workshops/{slug}/workshop.json` (not manifest.json, so watcher ignores it — read at startup only)
-- Workshop storage: `workshops` + `workshop_members` tables in SQLite; membership filter uses subquery `WHERE path IN (SELECT primitive_path FROM workshop_members WHERE workshop_slug = ?)`
 - Auth: single static API key; `Authorization: Bearer <key>` or `X-API-Key: <key>`; constant-time compare; `/health` always public; `--public-reads` opens GET endpoints
+- Workshops moved to Shell — Core serves flat, unscoped catalogue only; no workshop tables in SQLite
+- Core has no concept of users, ownership, or personal state
+- Shell is the only client of Core; modules never talk to Core directly
 
 ## Decisions Deferred
 
@@ -357,3 +370,13 @@ Nothing currently in progress.
 - All errors collected and returned together (not fail-fast), so callers see everything wrong at once
 - Called in `handleCreatePrimitive` and `handleUpdatePrimitive` after timestamps are stamped, before `WriteManifest` — nothing touches disk on invalid input
 - All 5 validation scenarios verified; PUT path verified separately
+
+### 2026-03-01 — Catalogue Refinement + Tests
+- Architectural clarification: Core = Catalogue (impersonal knowledge), Shell = host app (UserDB, auth, modules), Inventory = module-provided personal layer
+- Removed workshops from Core — workshops are personal lenses, belong in Shell's UserDB
+- Removed `workshops`/`workshop_members` SQLite tables, `IndexWorkshop`, `ReadWorkshops`, `?workshop=` query param, workshop fixture
+- `index.List` simplified: `List(ctx, typeFilter string)` — no workshopSlug param
+- Core now serves flat, unscoped catalogue only
+- Fixed Dockerfile: `golang:1.22-alpine` → `golang:1.24-alpine`
+- Added comprehensive test suite: `internal/git/git_test.go`, `internal/index/index_test.go`, `internal/schema/schema_test.go`, `internal/api/api_test.go`; all pass (`go test ./...`)
+- Core is feature-complete for v0
