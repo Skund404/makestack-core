@@ -23,10 +23,10 @@ func TestReadAll_FindsManifests(t *testing.T) {
 		t.Fatalf("ReadAll: %v", err)
 	}
 
-	// test/fixtures contains: tool-example, tools/stitching-chisel, materials/veg-tan-leather,
+	// test/fixtures contains: tools/stitching-chisel, materials/veg-tan-leather,
 	// techniques/saddle-stitching, workflows/bifold-wallet,
 	// projects/zombie-wallet-v1, projects/zombie-wallet-v1-card-pocket,
-	// events/leather-class-march-2026 — that is 8 manifest.json files.
+	// events/leather-class-march-2026 — that is 7 manifest.json files.
 	if len(manifests) < 1 {
 		t.Fatalf("expected at least 1 manifest, got 0")
 	}

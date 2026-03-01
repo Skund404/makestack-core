@@ -97,6 +97,9 @@ The data repo is a plain Git repository. Each primitive lives in its own directo
 
 ```
 makestack-data/
+├── .makestack/
+│   ├── config.json              # Shell configuration (served via Core API)
+│   └── modules/                 # Per-module configuration files
 ├── tools/
 │   └── {slug}/manifest.json
 ├── materials/
@@ -110,6 +113,8 @@ makestack-data/
 └── events/
     └── {slug}/manifest.json
 ```
+
+The `.makestack/` directory holds Shell configuration and is served by Core like any other file, but is not indexed as primitives.
 
 Every write through the API auto-commits to Git, giving you a full audit trail.
 
@@ -195,13 +200,13 @@ Reads directly from the Git object store; response includes `commit_hash`. Retur
 
 ---
 
-### Get HEAD Hash
+### Get Last-Modified Hash
 
 ```
 GET /api/primitives/{type}/{slug}/manifest.json/hash
 ```
 
-Returns `{"commit_hash": "abc123..."}` — the current HEAD hash for this primitive. The Shell stores this when adding a catalogue entry to a user's inventory, so it can retrieve the exact version later.
+Returns `{"commit_hash": "abc123..."}` — the hash of the most recent commit that modified this primitive, not the repository HEAD. The Shell stores this when adding a catalogue entry to a user's inventory, so it can retrieve the exact version later via `?at=`.
 
 ---
 

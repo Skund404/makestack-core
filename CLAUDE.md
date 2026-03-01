@@ -279,8 +279,9 @@ Nothing currently in progress.
 
 ## Next Steps (Priority Order)
 
-1. Update Dockerfile (Go 1.24 already done) and verify Docker build
-2. Core is feature-complete for v0 — next work moves to makestack-app (Shell)
+1. Core is feature-complete for v0 — all endpoints implemented and tested
+2. Next work moves to makestack-app (Shell): Python/FastAPI backend + React frontend
+3. The Shell will be the only client of Core, proxying all catalogue access for modules
 
 ---
 
@@ -305,7 +306,7 @@ Nothing currently in progress.
 - Workshops moved to Shell — Core serves flat, unscoped catalogue only; no workshop tables in SQLite
 - Core has no concept of users, ownership, or personal state
 - Shell is the only client of Core; modules never talk to Core directly
-- Version-specific reads: `?at={hash}` reads directly from Git object store (bypasses SQLite); `/hash` sub-resource returns HEAD hash for Shell to pin inventory records; both return 503 when writer is nil
+- Version-specific reads: `?at={hash}` reads directly from Git object store (bypasses SQLite); `/hash` sub-resource returns the last-modified-commit hash for that path (not repo HEAD) for Shell to pin inventory records; both return 503 when writer is nil
 - Go 1.22 mux `{path...}/suffix` limitation: detected via `strings.HasSuffix` inside the wildcard handler — safe because all primitive paths end with `/manifest.json`
 
 ## Decisions Deferred
@@ -389,6 +390,16 @@ Nothing currently in progress.
 - `internal/git/history.go`: `CommitHistoryForPath`, `CommitTimestamp`, `ParentHash`, `DiffManifests` (recursive JSON diff); `CommitInfo` and `FieldChange` exported types; private `diffMaps`/`diffValues`/`diffSlices` helpers; results sorted by field path for determinism
 - Routing via suffix detection in `handleGetPrimitive` (consistent with `/hash`); `parsePositiveInt` helper for query param parsing
 - Tests: 5 unit tests for `CommitHistoryForPath`, 2 for `ParentHash`, 10-case table-driven `DiffManifests` test; 10 API integration tests via `newGitTestServer` / new `newGitTestServer2` (2-commit) helper; `go test -race ./...` passes
+
+### 2026-03-01 — Final Core Cleanup Before Shell Development
+- Fixed `/hash` endpoint: `handleGetPrimitiveHash` now calls `LastCommitHashForPath` (path-filtered git log) instead of `HeadHash` (repo-wide HEAD); added `LastCommitHashForPath` to `internal/git/history.go`
+- Added unit tests for `LastCommitHashForPath` and an API regression test (`TestGetPrimitiveHash_ReturnsPathSpecificHash_NotRepoHead`) that encodes the bug scenario
+- README expanded: full endpoint docs, all CLI flags, auth details, data layout; `/hash` section corrected to describe path-specific hash
+- Deleted stale `test/fixtures/tool-example/` (wrong path, duplicate of `tools/stitching-chisel`); updated comment in `git_test.go`
+- CONTRIBUTING.md: Go 1.22+ → Go 1.24+
+- README: added `.makestack/` to data repo layout with note that it holds Shell config but is not indexed as primitives
+- CLAUDE.md: updated Next Steps, corrected stale `/hash` description in Decisions Made
+- `go test -race ./...` — all packages pass
 
 ### 2026-03-01 — Version-Specific Primitive Retrieval
 - Added `internal/git/history.go`: `ReadManifestAtCommit(path, commitHash)` reads a manifest from the Git object store at any past commit; `HeadHash()` returns the current HEAD hash as a 40-char hex string; `ErrNotFound` sentinel (wraps `plumbing.ErrObjectNotFound` / `object.ErrFileNotFound`) so callers don't import go-git plumbing packages
