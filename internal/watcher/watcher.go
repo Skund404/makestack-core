@@ -107,10 +107,14 @@ func (w *Watcher) watchAllDirs() error {
 
 // handleEvent is called for every raw fsnotify event.
 func (w *Watcher) handleEvent(ctx context.Context, event fsnotify.Event) {
-	// When a new directory is created, recursively watch it and process any
-	// manifest.json files already inside it. The write API creates the entire
-	// directory tree in one shot (MkdirAll + WriteFile), so subdirectories and
-	// their files may already exist by the time the watcher fires for the parent.
+	// When a new directory is created, recursively watch it and schedule
+	// debounced processing for any manifest.json files already inside it.
+	// The write API creates the entire directory tree in one shot (MkdirAll +
+	// WriteFile), so the directory Create event may fire before WriteFile
+	// finishes. Scheduling through the debounce (rather than calling process
+	// directly) means we wait for the file to settle — and if the file's own
+	// Create event arrives moments later it simply resets the timer, so process
+	// runs exactly once on the completed file.
 	if event.Has(fsnotify.Create) {
 		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
 			_ = filepath.WalkDir(event.Name, func(path string, d fs.DirEntry, err error) error {
@@ -122,7 +126,7 @@ func (w *Watcher) handleEvent(ctx context.Context, event fsnotify.Event) {
 						log.Printf("watcher: watch new dir %s: %v", path, addErr)
 					}
 				} else if filepath.Base(path) == "manifest.json" {
-					w.process(ctx, path)
+					w.schedule(ctx, path) // was: w.process(ctx, path)
 				}
 				return nil
 			})
@@ -135,14 +139,18 @@ func (w *Watcher) handleEvent(ctx context.Context, event fsnotify.Event) {
 		return
 	}
 
-	// Debounce: cancel any pending timer for this path and start a fresh one.
-	// The closure captures the absolute path; after the delay it checks
-	// whether the file still exists to decide upsert vs delete.
+	w.schedule(ctx, event.Name)
+}
+
+// schedule arms (or resets) the debounce timer for absPath. If a timer is
+// already pending for this path it is cancelled and replaced so that only one
+// process call runs — after the file has been quiet for debounceDelay.
+// Safe to call from multiple goroutines.
+func (w *Watcher) schedule(ctx context.Context, absPath string) {
 	w.mu.Lock()
-	if e, ok := w.pending[event.Name]; ok {
+	if e, ok := w.pending[absPath]; ok {
 		e.timer.Stop()
 	}
-	absPath := event.Name
 	w.pending[absPath] = &pendingEntry{
 		timer: time.AfterFunc(debounceDelay, func() {
 			w.mu.Lock()

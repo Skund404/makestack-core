@@ -99,6 +99,13 @@ func Open(path string) (*Index, error) {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
 
+	// SQLite allows only one active writer at a time. Limiting the connection
+	// pool to a single connection serialises all reads and writes through one
+	// handle, preventing concurrent goroutines (watcher timer callbacks, HTTP
+	// handlers) from racing on write transactions and receiving SQLITE_BUSY
+	// errors. Waiters block at the pool level rather than failing.
+	db.SetMaxOpenConns(1)
+
 	for _, stmt := range schemaStmts {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()

@@ -3,6 +3,8 @@ package index
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"testing"
 
 	gitpkg "github.com/makestack/makestack-core/internal/git"
@@ -361,5 +363,97 @@ func TestIndexManifest_FullPipeline(t *testing.T) {
 	}
 	if len(rels) != 1 || rels[0].RelType != "uses_tool" {
 		t.Errorf("expected 1 uses_tool relationship, got %+v", rels)
+	}
+}
+
+// — Concurrency ——————————————————————————————————————————————————————————————
+
+// TestConcurrentWrites verifies that many goroutines can write to the index
+// simultaneously without SQLITE_BUSY errors. This is the real-world pattern
+// for the watcher, where multiple debounce timer callbacks can fire at the
+// same time when many files change at once. Without SetMaxOpenConns(1) in
+// Open(), this test reliably produces "database is locked" errors.
+func TestConcurrentWrites(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	const n = 50
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id := fmt.Sprintf("tool-%d", i)
+			p := testPrimitive(id, "tool", "Tool "+id, id, "tools/"+id+"/manifest.json")
+			if err := idx.UpsertFull(ctx, p, nil); err != nil {
+				errs <- fmt.Errorf("goroutine %d: %w", i, err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("concurrent write failed: %v", err)
+	}
+
+	// All 50 primitives must be present.
+	count, err := idx.CountAll(ctx)
+	if err != nil {
+		t.Fatalf("CountAll: %v", err)
+	}
+	if count != n {
+		t.Errorf("expected %d primitives after concurrent writes, got %d", n, count)
+	}
+}
+
+// TestConcurrentReadWrite verifies that reads and writes interleave safely.
+// Writers upsert; readers call List concurrently. No SQLITE_BUSY or panic
+// should occur.
+func TestConcurrentReadWrite(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	// Seed some data first.
+	for i := range 10 {
+		id := fmt.Sprintf("seed-%d", i)
+		_ = idx.UpsertFull(ctx, testPrimitive(id, "tool", "Seed "+id, id, "tools/"+id+"/manifest.json"), nil)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 100)
+
+	// Writers: 20 goroutines upsert different paths.
+	for i := range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id := fmt.Sprintf("writer-%d", i)
+			p := testPrimitive(id, "material", "Mat "+id, id, "materials/"+id+"/manifest.json")
+			if err := idx.UpsertFull(ctx, p, nil); err != nil {
+				errs <- fmt.Errorf("writer %d: %w", i, err)
+			}
+		}()
+	}
+
+	// Readers: 20 goroutines call List concurrently.
+	for i := range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := idx.List(ctx, ""); err != nil {
+				errs <- fmt.Errorf("reader %d: %w", i, err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("concurrent read/write failed: %v", err)
 	}
 }
