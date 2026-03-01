@@ -20,13 +20,28 @@ import (
 )
 
 func main() {
-	dataDir := flag.String("data", "", "Path to the makestack data repository (required)")
-	addr := flag.String("addr", ":8420", "Address to listen on")
-	dbPath := flag.String("db", ":memory:", "SQLite index path (use :memory: for ephemeral)")
+	dataDir     := flag.String("data", "", "Path to the makestack data repository (required)")
+	addr        := flag.String("addr", ":8420", "Address to listen on")
+	dbPath      := flag.String("db", ":memory:", "SQLite index path (use :memory: for ephemeral)")
+	apiKeyFlag  := flag.String("api-key", "", "API key for authentication (overrides MAKESTACK_API_KEY env var)")
+	publicReads := flag.Bool("public-reads", false, "Allow unauthenticated access to read-only endpoints")
 	flag.Parse()
 
 	if *dataDir == "" {
 		log.Fatal("error: -data flag is required")
+	}
+
+	// Resolve API key: flag takes precedence over environment variable.
+	apiKey := *apiKeyFlag
+	if apiKey == "" {
+		apiKey = os.Getenv("MAKESTACK_API_KEY")
+	}
+	if apiKey == "" {
+		log.Println("warning: no API key configured — all endpoints are unauthenticated")
+	} else if *publicReads {
+		log.Println("auth: API key set; read endpoints are public (--public-reads), write endpoints require key")
+	} else {
+		log.Println("auth: API key set; all endpoints require key")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -99,7 +114,7 @@ func main() {
 	// — Start HTTP server ————————————————————————————————————————————————————
 	srv := &http.Server{
 		Addr:         *addr,
-		Handler:      api.NewServer(idx, writer),
+		Handler:      api.NewServer(idx, writer, apiKey, *publicReads),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	gitpkg "github.com/makestack/makestack-core/internal/git"
+	"github.com/makestack/makestack-core/internal/auth"
 	"github.com/makestack/makestack-core/internal/index"
 )
 
@@ -28,19 +29,26 @@ var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
 
 // Server is the makestack-core REST API server.
 type Server struct {
-	mux    *http.ServeMux
-	idx    *index.Index
-	writer *gitpkg.Writer // nil when the data dir is not a git repo
+	mux         *http.ServeMux
+	idx         *index.Index
+	writer      *gitpkg.Writer // nil when the data dir is not a git repo
+	apiKey      string         // empty = auth disabled
+	publicReads bool           // when true, GET endpoints skip auth
 }
 
-// NewServer creates a Server wired to the given index and optional writer,
-// and registers all routes. writer may be nil — write endpoints will return
-// 503 Service Unavailable when it is.
-func NewServer(idx *index.Index, writer *gitpkg.Writer) *Server {
+// NewServer creates a Server wired to the given index, optional writer, and
+// auth config, then registers all routes.
+//
+//   - writer may be nil — write endpoints return 503 when it is.
+//   - apiKey empty string disables authentication entirely.
+//   - publicReads true allows GET endpoints without a key even when apiKey is set.
+func NewServer(idx *index.Index, writer *gitpkg.Writer, apiKey string, publicReads bool) *Server {
 	s := &Server{
-		mux:    http.NewServeMux(),
-		idx:    idx,
-		writer: writer,
+		mux:         http.NewServeMux(),
+		idx:         idx,
+		writer:      writer,
+		apiKey:      apiKey,
+		publicReads: publicReads,
 	}
 	s.registerRoutes()
 	return s
@@ -52,20 +60,40 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) registerRoutes() {
+	// /health is always public — used by load balancers and health checks.
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 
-	// Read — primitives.
-	s.mux.HandleFunc("GET /api/primitives", s.handleListPrimitives)
-	s.mux.HandleFunc("GET /api/primitives/{path...}", s.handleGetPrimitive)
+	// readAuth wraps GET handlers with auth. When --public-reads is set it
+	// becomes a no-op so reads are accessible without a key.
+	readAuth := s.withAuth
+	if s.publicReads {
+		readAuth = func(h http.HandlerFunc) http.HandlerFunc { return h }
+	}
 
-	// Write — primitives.
-	s.mux.HandleFunc("POST /api/primitives", s.handleCreatePrimitive)
-	s.mux.HandleFunc("PUT /api/primitives/{path...}", s.handleUpdatePrimitive)
-	s.mux.HandleFunc("DELETE /api/primitives/{path...}", s.handleDeletePrimitive)
+	// Read — primitives.
+	s.mux.HandleFunc("GET /api/primitives", readAuth(s.handleListPrimitives))
+	s.mux.HandleFunc("GET /api/primitives/{path...}", readAuth(s.handleGetPrimitive))
+
+	// Write — primitives (always protected regardless of --public-reads).
+	s.mux.HandleFunc("POST /api/primitives", s.withAuth(s.handleCreatePrimitive))
+	s.mux.HandleFunc("PUT /api/primitives/{path...}", s.withAuth(s.handleUpdatePrimitive))
+	s.mux.HandleFunc("DELETE /api/primitives/{path...}", s.withAuth(s.handleDeletePrimitive))
 
 	// Search and relationships.
-	s.mux.HandleFunc("GET /api/search", s.handleSearch)
-	s.mux.HandleFunc("GET /api/relationships/{path...}", s.handleRelationships)
+	s.mux.HandleFunc("GET /api/search", readAuth(s.handleSearch))
+	s.mux.HandleFunc("GET /api/relationships/{path...}", readAuth(s.handleRelationships))
+}
+
+// withAuth wraps a handler so it requires a valid API key before proceeding.
+// If the Server has no key configured, all requests pass through.
+func (s *Server) withAuth(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := auth.ValidateRequest(r, s.apiKey); err != nil {
+			writeError(w, http.StatusUnauthorized, err)
+			return
+		}
+		h(w, r)
+	}
 }
 
 // — read handlers —————————————————————————————————————————————————————————————
