@@ -233,7 +233,7 @@ The full specs are in the makestack-docs repo. Key documents for Core developmen
 
 ## Current State
 
-Core: MVP COMPLETE — WORKSHOPS DONE
+Core: MVP COMPLETE — SCHEMA VALIDATION DONE
 
 - [x] Go module initialized (`github.com/makestack/makestack-core`)
 - [x] Project structure created
@@ -248,7 +248,7 @@ Core: MVP COMPLETE — WORKSHOPS DONE
 - [x] Test fixtures — one of each primitive type + workshop fixture
 - [x] Authentication — API key via `--api-key` flag or `MAKESTACK_API_KEY` env var; `--public-reads` makes GET endpoints open; constant-time comparison; `/health` always public
 - [x] Workshop support — `GET /api/primitives?workshop=<slug>[&type=<t>]`; workshops indexed from `workshops/*/workshop.json` at startup into SQLite `workshops` + `workshop_members` tables
-- [ ] JSON schema validation
+- [x] JSON schema validation — `internal/schema`: structural type checks on POST/PUT; common (description/tags/relationships) + type-specific (steps, parent_project); all errors returned at once; 400 on failure
 - [ ] Tests (unit + integration)
 
 ---
@@ -267,9 +267,8 @@ Nothing currently in progress.
 
 ## Next Steps (Priority Order)
 
-1. JSON schema validation on POST/PUT (validate against per-type schema)
-2. Unit + integration tests
-3. Dockerize
+1. Unit + integration tests
+2. Dockerize
 
 ---
 
@@ -350,3 +349,11 @@ Nothing currently in progress.
 - `--api-key` flag overrides `MAKESTACK_API_KEY` env var; no key → warning + open access
 - `--public-reads` flag makes GET endpoints public while keeping writes protected
 - Logs auth mode at startup; all scenarios smoke-tested
+
+### 2026-03-01 — JSON Schema Validation
+- Implemented `internal/schema/schema.go`: `Validate(primType, body)` — no external libraries, pure Go
+- Common checks (all types): `description` string, `tags` array-of-strings, `relationships` array of objects with non-empty `type` + `target`; element-level errors e.g. `relationships[1]: missing required field "target"`
+- Type-specific: `technique`/`workflow` → `steps` must be array; `project` → `parent_project` must be string; `tool`/`material`/`event` → no extra checks
+- All errors collected and returned together (not fail-fast), so callers see everything wrong at once
+- Called in `handleCreatePrimitive` and `handleUpdatePrimitive` after timestamps are stamped, before `WriteManifest` — nothing touches disk on invalid input
+- All 5 validation scenarios verified; PUT path verified separately
