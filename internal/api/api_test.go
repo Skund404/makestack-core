@@ -474,3 +474,284 @@ func TestGetPrimitiveHash_NoWriter_Returns503(t *testing.T) {
 		t.Errorf("expected 503, got %d", resp.StatusCode)
 	}
 }
+
+// newGitTestServer2 creates a Server backed by a temp git repository with the
+// same manifest committed twice — once with the original description and once
+// with an updated description. Returns the server, the first (older) commit
+// hash, the second (newer) commit hash, and the manifest path.
+func newGitTestServer2(t *testing.T) (*httptest.Server, string, string, string) {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+
+	w, err := gitpkg.NewWriter(tmpDir)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+
+	const manifestPath = "tools/wing-divider/manifest.json"
+	const v1 = `{
+		"id":          "tool-wd-001",
+		"type":        "tool",
+		"name":        "Wing Divider",
+		"slug":        "wing-divider",
+		"created":     "2026-01-01T00:00:00Z",
+		"modified":    "2026-01-01T00:00:00Z",
+		"description": "Original description",
+		"tags":        ["leather", "marking"]
+	}`
+	if err := w.WriteManifest(manifestPath, []byte(v1), "add wing divider v1"); err != nil {
+		t.Fatalf("WriteManifest v1: %v", err)
+	}
+	hash1, err := w.HeadHash()
+	if err != nil {
+		t.Fatalf("HeadHash after v1: %v", err)
+	}
+
+	const v2 = `{
+		"id":          "tool-wd-001",
+		"type":        "tool",
+		"name":        "Wing Divider",
+		"slug":        "wing-divider",
+		"created":     "2026-01-01T00:00:00Z",
+		"modified":    "2026-06-01T00:00:00Z",
+		"description": "Updated description",
+		"tags":        ["leather", "marking"]
+	}`
+	if err := w.WriteManifest(manifestPath, []byte(v2), "update wing divider v2"); err != nil {
+		t.Fatalf("WriteManifest v2: %v", err)
+	}
+	hash2, err := w.HeadHash()
+	if err != nil {
+		t.Fatalf("HeadHash after v2: %v", err)
+	}
+
+	idx, err := index.Open(":memory:")
+	if err != nil {
+		t.Fatalf("index.Open: %v", err)
+	}
+	t.Cleanup(func() { idx.Close() })
+
+	ctx := context.Background()
+	m := gitpkg.Manifest{Path: manifestPath, Raw: json.RawMessage(v2)}
+	pm, err := m.Parse()
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if err := idx.IndexManifest(ctx, pm); err != nil {
+		t.Fatalf("IndexManifest: %v", err)
+	}
+	if err := idx.RebuildFTS(ctx); err != nil {
+		t.Fatalf("RebuildFTS: %v", err)
+	}
+
+	srv := NewServer(idx, w, "" /* no auth */, false)
+	return httptest.NewServer(srv), hash1, hash2, manifestPath
+}
+
+// — GET /api/primitives/{path}/history ————————————————————————————————————————
+
+func TestGetPrimitiveHistory_ReturnsList(t *testing.T) {
+	srv, commitHash, path := newGitTestServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/"+path+"/history")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var result struct {
+		Path    string                   `json:"path"`
+		Total   int                      `json:"total"`
+		Commits []map[string]interface{} `json:"commits"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if result.Total != 1 {
+		t.Errorf("total: got %d, want 1", result.Total)
+	}
+	if len(result.Commits) != 1 {
+		t.Fatalf("len(commits): got %d, want 1", len(result.Commits))
+	}
+	if result.Commits[0]["hash"] != commitHash {
+		t.Errorf("commits[0].hash: got %v, want %q", result.Commits[0]["hash"], commitHash)
+	}
+}
+
+func TestGetPrimitiveHistory_Pagination(t *testing.T) {
+	srv, _, _, path := newGitTestServer2(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/"+path+"/history?limit=1&offset=0")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var result struct {
+		Total   int                      `json:"total"`
+		Commits []map[string]interface{} `json:"commits"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if result.Total != 2 {
+		t.Errorf("total: got %d, want 2", result.Total)
+	}
+	if len(result.Commits) != 1 {
+		t.Errorf("len(commits): got %d, want 1 (limit applied)", len(result.Commits))
+	}
+}
+
+func TestGetPrimitiveHistory_UnknownPath_ReturnsEmpty(t *testing.T) {
+	srv, _, _ := newGitTestServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/tools/nonexistent/manifest.json/history")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 (empty list), got %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Total   int                      `json:"total"`
+		Commits []map[string]interface{} `json:"commits"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if result.Total != 0 {
+		t.Errorf("total: got %d, want 0", result.Total)
+	}
+	if len(result.Commits) != 0 {
+		t.Errorf("len(commits): got %d, want 0", len(result.Commits))
+	}
+}
+
+func TestGetPrimitiveHistory_NoWriter_Returns503(t *testing.T) {
+	srv := newTestServer(t, "", false)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/tools/stitching-chisel/manifest.json/history")
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", resp.StatusCode)
+	}
+}
+
+// — GET /api/primitives/{path}/diff ———————————————————————————————————————————
+
+func TestGetPrimitiveDiff_ExplicitHashes(t *testing.T) {
+	srv, hash1, hash2, path := newGitTestServer2(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/"+path+"/diff?from="+hash1+"&to="+hash2)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var result struct {
+		Path          string                   `json:"path"`
+		FromHash      string                   `json:"from_hash"`
+		ToHash        string                   `json:"to_hash"`
+		FromTimestamp string                   `json:"from_timestamp"`
+		ToTimestamp   string                   `json:"to_timestamp"`
+		Changes       []map[string]interface{} `json:"changes"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if result.FromHash != hash1 {
+		t.Errorf("from_hash: got %q, want %q", result.FromHash, hash1)
+	}
+	if result.ToHash != hash2 {
+		t.Errorf("to_hash: got %q, want %q", result.ToHash, hash2)
+	}
+	if result.FromTimestamp == "" {
+		t.Error("from_timestamp is empty")
+	}
+	if result.ToTimestamp == "" {
+		t.Error("to_timestamp is empty")
+	}
+
+	// The description field changed between v1 and v2.
+	foundDesc := false
+	for _, c := range result.Changes {
+		if c["field"] == "description" {
+			foundDesc = true
+			if c["type"] != "modified" {
+				t.Errorf("description change type: got %v, want \"modified\"", c["type"])
+			}
+		}
+	}
+	if !foundDesc {
+		t.Error("expected a change for 'description' field, but none found")
+	}
+}
+
+func TestGetPrimitiveDiff_DefaultToIsHEAD(t *testing.T) {
+	srv, hash1, _, path := newGitTestServer2(t)
+	defer srv.Close()
+
+	// Provide only from= — to= should default to HEAD.
+	resp := get(t, srv, "/api/primitives/"+path+"/diff?from="+hash1)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var result struct {
+		ToHash  string                   `json:"to_hash"`
+		Changes []map[string]interface{} `json:"changes"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if len(result.ToHash) != 40 {
+		t.Errorf("to_hash should be a 40-char hash, got %q", result.ToHash)
+	}
+}
+
+func TestGetPrimitiveDiff_DefaultFromIsParent(t *testing.T) {
+	srv, hash1, _, path := newGitTestServer2(t)
+	defer srv.Close()
+
+	// Omit both — to= defaults to HEAD, from= defaults to parent of HEAD.
+	resp := get(t, srv, "/api/primitives/"+path+"/diff")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var result struct {
+		FromHash string `json:"from_hash"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if result.FromHash != hash1 {
+		t.Errorf("from_hash: got %q, want %q (the parent commit)", result.FromHash, hash1)
+	}
+}
+
+func TestGetPrimitiveDiff_NoParent_Returns400(t *testing.T) {
+	// newGitTestServer has only one commit — no parent exists.
+	srv, _, path := newGitTestServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/"+path+"/diff")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 (no parent), got %d", resp.StatusCode)
+	}
+}
+
+func TestGetPrimitiveDiff_BadHash_Returns404(t *testing.T) {
+	srv, _, _, path := newGitTestServer2(t)
+	defer srv.Close()
+
+	const badHash = "0000000000000000000000000000000000000000"
+	resp := get(t, srv, "/api/primitives/"+path+"/diff?from="+badHash+"&to="+badHash)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestGetPrimitiveDiff_NoWriter_Returns503(t *testing.T) {
+	srv := newTestServer(t, "", false)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/tools/stitching-chisel/manifest.json/diff")
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", resp.StatusCode)
+	}
+}

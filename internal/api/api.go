@@ -140,9 +140,17 @@ func (s *Server) handleGetPrimitive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sub-resource: GET /api/primitives/{path...}/hash
+	// Sub-resources: /history, /diff, /hash
 	// Go 1.22 mux does not support {wildcard}/literal patterns, so we detect
-	// the suffix here and delegate.
+	// suffixes here and delegate.
+	if strings.HasSuffix(path, "/history") {
+		s.handleGetPrimitiveHistory(w, r, strings.TrimSuffix(path, "/history"))
+		return
+	}
+	if strings.HasSuffix(path, "/diff") {
+		s.handleGetPrimitiveDiff(w, r, strings.TrimSuffix(path, "/diff"))
+		return
+	}
 	if strings.HasSuffix(path, "/hash") {
 		s.handleGetPrimitiveHash(w, r, strings.TrimSuffix(path, "/hash"))
 		return
@@ -224,6 +232,145 @@ func (s *Server) handleGetPrimitiveHash(w http.ResponseWriter, r *http.Request, 
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"commit_hash": hash})
+}
+
+// handleGetPrimitiveHistory serves GET /api/primitives/{path...}/history.
+// Returns the list of commits that touched this primitive, newest first.
+// Pagination via ?limit= (default 50, max 200) and ?offset= (default 0).
+func (s *Server) handleGetPrimitiveHistory(w http.ResponseWriter, r *http.Request, path string) {
+	if s.writer == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			fmt.Errorf("git operations unavailable: data directory is not a git repository"))
+		return
+	}
+
+	limit := 50
+	offset := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			limit = n
+		}
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			offset = n
+		}
+	}
+
+	commits, total, err := s.writer.CommitHistoryForPath(path, limit, offset)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"path":    path,
+		"total":   total,
+		"commits": commits,
+	})
+}
+
+// handleGetPrimitiveDiff serves GET /api/primitives/{path...}/diff.
+// Returns a structured field-level diff between two versions of a primitive.
+//
+//   - ?from= and ?to= are full 40-char commit hashes.
+//   - If ?to= is omitted, HEAD is used.
+//   - If ?from= is omitted, the parent of ?to= is used; if the commit has no
+//     parent (initial commit), a 400 is returned.
+func (s *Server) handleGetPrimitiveDiff(w http.ResponseWriter, r *http.Request, path string) {
+	if s.writer == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			fmt.Errorf("git operations unavailable: data directory is not a git repository"))
+		return
+	}
+
+	fromHash := r.URL.Query().Get("from")
+	toHash := r.URL.Query().Get("to")
+
+	// Default ?to= to HEAD.
+	if toHash == "" {
+		var err error
+		toHash, err = s.writer.HeadHash()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("resolve HEAD: %w", err))
+			return
+		}
+	}
+
+	// Default ?from= to parent of ?to=.
+	if fromHash == "" {
+		var err error
+		fromHash, err = s.writer.ParentHash(toHash)
+		if err != nil {
+			if errors.Is(err, gitpkg.ErrNotFound) {
+				writeError(w, http.StatusBadRequest,
+					fmt.Errorf("commit %s has no parent; specify ?from= explicitly", toHash))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+
+	fromPM, err := s.writer.ReadManifestAtCommit(path, fromHash)
+	if err != nil {
+		if errors.Is(err, gitpkg.ErrNotFound) {
+			writeError(w, http.StatusNotFound,
+				fmt.Errorf("not found: %s at commit %s", path, fromHash))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	toPM, err := s.writer.ReadManifestAtCommit(path, toHash)
+	if err != nil {
+		if errors.Is(err, gitpkg.ErrNotFound) {
+			writeError(w, http.StatusNotFound,
+				fmt.Errorf("not found: %s at commit %s", path, toHash))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	fromTS, err := s.writer.CommitTimestamp(fromHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	toTS, err := s.writer.CommitTimestamp(toHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	changes := gitpkg.DiffManifests(fromPM.Raw, toPM.Raw)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"path":           path,
+		"from_hash":      fromHash,
+		"to_hash":        toHash,
+		"from_timestamp": fromTS,
+		"to_timestamp":   toTS,
+		"changes":        changes,
+	})
+}
+
+// parsePositiveInt parses s as a non-negative integer.
+func parsePositiveInt(s string) (int, error) {
+	var n int
+	_, err := fmt.Sscanf(s, "%d", &n)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("not a non-negative integer: %q", s)
+	}
+	return n, nil
 }
 
 // handleSearch handles GET /api/search?q=<query>.
