@@ -252,7 +252,7 @@ Core: **FEATURE COMPLETE FOR v0**
 - [x] Git operations: read — `internal/git`: walks data dir, reads all `manifest.json` files, parses typed fields, validates required fields, extracts relationships
 - [x] Git operations: write — `internal/git/writer.go`: WriteManifest + DeleteManifest, auto-commits via go-git
 - [x] SQLite indexer — `internal/index`: full schema (primitives, relationships, FTS5), `UpsertFull` (atomic tx), `Delete`, `List`, `Get`, `Search`, `RelationshipsFor`, `RebuildFTS`
-- [x] REST API read — `GET /health`, `GET /api/primitives[?type=]`, `GET /api/primitives/{path...}[?at={hash}]`, `GET /api/primitives/{path...}/hash`, `GET /api/search?q=`, `GET /api/relationships/{path...}`
+- [x] REST API read — `GET /health`, `GET /api/primitives[?type=]`, `GET /api/primitives/{path...}[?at={hash}]`, `GET /api/primitives/{path...}/hash`, `GET /api/primitives/{path...}/history[?limit=&offset=]`, `GET /api/primitives/{path...}/diff[?from=&to=]`, `GET /api/search?q=`, `GET /api/relationships/{path...}`
 - [x] REST API write — `POST /api/primitives` (create, auto id/slug/timestamps), `PUT /api/primitives/{path...}` (update), `DELETE /api/primitives/{path...}` (delete)
 - [x] Full-text search (FTS5) — indexes name, description, tags, properties
 - [x] Relationship indexing + reverse lookups — `RelationshipsFor` returns both directions
@@ -382,6 +382,13 @@ Nothing currently in progress.
 - Fixed Dockerfile: `golang:1.22-alpine` → `golang:1.24-alpine`
 - Added comprehensive test suite: `internal/git/git_test.go`, `internal/index/index_test.go`, `internal/schema/schema_test.go`, `internal/api/api_test.go`; all pass (`go test ./...`)
 - Core is feature-complete for v0
+
+### 2026-03-01 — Git History and Diff Endpoints
+- Added `GET /api/primitives/{path}/history?limit=50&offset=0` — paginated commit log for a path; returns hash, message, author, timestamp per commit; empty list (not 404) for unknown paths; uses go-git `PathFilter` to walk commits that touched the file
+- Added `GET /api/primitives/{path}/diff?from=HASH&to=HASH` — structured field-level JSON diff between two commits; `to=` defaults to HEAD; `from=` defaults to parent of `to=`; returns 400 if the target commit has no parent
+- `internal/git/history.go`: `CommitHistoryForPath`, `CommitTimestamp`, `ParentHash`, `DiffManifests` (recursive JSON diff); `CommitInfo` and `FieldChange` exported types; private `diffMaps`/`diffValues`/`diffSlices` helpers; results sorted by field path for determinism
+- Routing via suffix detection in `handleGetPrimitive` (consistent with `/hash`); `parsePositiveInt` helper for query param parsing
+- Tests: 5 unit tests for `CommitHistoryForPath`, 2 for `ParentHash`, 10-case table-driven `DiffManifests` test; 10 API integration tests via `newGitTestServer` / new `newGitTestServer2` (2-commit) helper; `go test -race ./...` passes
 
 ### 2026-03-01 — Version-Specific Primitive Retrieval
 - Added `internal/git/history.go`: `ReadManifestAtCommit(path, commitHash)` reads a manifest from the Git object store at any past commit; `HeadHash()` returns the current HEAD hash as a 40-char hex string; `ErrNotFound` sentinel (wraps `plumbing.ErrObjectNotFound` / `object.ErrFileNotFound`) so callers don't import go-git plumbing packages
