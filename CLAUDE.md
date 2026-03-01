@@ -233,7 +233,7 @@ The full specs are in the makestack-docs repo. Key documents for Core developmen
 
 ## Current State
 
-Core: MVP COMPLETE — AUTH DONE
+Core: MVP COMPLETE — WORKSHOPS DONE
 
 - [x] Go module initialized (`github.com/makestack/makestack-core`)
 - [x] Project structure created
@@ -247,7 +247,7 @@ Core: MVP COMPLETE — AUTH DONE
 - [x] File watcher — `internal/watcher`: fsnotify v1.9.0, recursive dir watching, 200 ms debounce, handles create/edit/delete live; recursively processes new dirs to avoid race with write API
 - [x] Test fixtures — one of each primitive type + workshop fixture
 - [x] Authentication — API key via `--api-key` flag or `MAKESTACK_API_KEY` env var; `--public-reads` makes GET endpoints open; constant-time comparison; `/health` always public
-- [ ] Workshop support (scope queries by workshop)
+- [x] Workshop support — `GET /api/primitives?workshop=<slug>[&type=<t>]`; workshops indexed from `workshops/*/workshop.json` at startup into SQLite `workshops` + `workshop_members` tables
 - [ ] JSON schema validation
 - [ ] Tests (unit + integration)
 
@@ -267,10 +267,9 @@ Nothing currently in progress.
 
 ## Next Steps (Priority Order)
 
-1. Workshop-scoped queries (`GET /api/primitives?workshop=leatherwork`)
-2. JSON schema validation on POST/PUT (validate against per-type schema)
-3. Unit + integration tests
-4. Dockerize
+1. JSON schema validation on POST/PUT (validate against per-type schema)
+2. Unit + integration tests
+3. Dockerize
 
 ---
 
@@ -291,7 +290,8 @@ Nothing currently in progress.
 - Watcher debounce: 200 ms (handles editor atomic-rename save patterns)
 - `index.IndexManifest` is the single conversion point from `git.ParsedManifest` to index rows (bulk loader and watcher both call it)
 - Write path: POST/PUT/DELETE write to Git and commit; watcher picks up change and updates index async
-- Workshop fixture format: `workshops/{slug}/workshop.json` (not manifest.json, so reader/watcher ignore it — read-only reference for now)
+- Workshop fixture format: `workshops/{slug}/workshop.json` (not manifest.json, so watcher ignores it — read at startup only)
+- Workshop storage: `workshops` + `workshop_members` tables in SQLite; membership filter uses subquery `WHERE path IN (SELECT primitive_path FROM workshop_members WHERE workshop_slug = ?)`
 - Auth: single static API key; `Authorization: Bearer <key>` or `X-API-Key: <key>`; constant-time compare; `/health` always public; `--public-reads` opens GET endpoints
 
 ## Decisions Deferred
@@ -335,6 +335,14 @@ Nothing currently in progress.
 - Fixed watcher `handleEvent` to recursively walk + process new directories (fixes race condition where write API creates dirs too fast for fsnotify)
 - Added `test/fixtures/workshops/leatherwork/workshop.json`
 - All write endpoints verified: POST 201 + auto fields, PUT 200, DELETE 204; all commit to Git; index updated via watcher ~200ms later
+
+### 2026-03-01 — Workshop-scoped queries
+- Added `internal/git/workshop.go`: `ReadWorkshops` walks `workshops/*/workshop.json`, parses slug/name/primitives list
+- Added `workshops` + `workshop_members` SQLite tables; `IndexWorkshop` upserts atomically (delete-then-reinsert members)
+- Updated `index.List` to accept `workshopSlug` param; uses `WHERE path IN (subquery)` — four SQL branches for all filter combinations
+- Updated `handleListPrimitives` to extract `?workshop=` query param
+- Updated `main.go` to read and index workshops after manifest bulk load
+- Verified: 7/8 primitives in leatherwork workshop; type+workshop combined filter works; unknown slug returns `[]`
 
 ### 2026-03-01 — Authentication
 - Implemented `internal/auth/auth.go`: `ValidateRequest` checks `Authorization: Bearer` or `X-API-Key` header with `subtle.ConstantTimeCompare`
