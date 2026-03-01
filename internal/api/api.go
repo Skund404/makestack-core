@@ -5,6 +5,7 @@ package api
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -121,6 +122,17 @@ func (s *Server) handleListPrimitives(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetPrimitive handles GET /api/primitives/{path...}.
+//
+// Two optional behaviours are layered on top of the normal index lookup:
+//
+//   - If the path ends with "/hash", strip the suffix and return the current
+//     HEAD commit hash for that primitive (see handleGetPrimitiveHash).
+//     All valid primitive paths end with "/manifest.json", so "/hash" is
+//     unambiguous as a sub-resource indicator.
+//
+//   - If the query parameter "at" is present, read the manifest from that
+//     specific Git commit instead of the live SQLite index (see
+//     handleGetPrimitiveAtCommit).
 func (s *Server) handleGetPrimitive(w http.ResponseWriter, r *http.Request) {
 	path := r.PathValue("path")
 	if path == "" {
@@ -128,6 +140,21 @@ func (s *Server) handleGetPrimitive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Sub-resource: GET /api/primitives/{path...}/hash
+	// Go 1.22 mux does not support {wildcard}/literal patterns, so we detect
+	// the suffix here and delegate.
+	if strings.HasSuffix(path, "/hash") {
+		s.handleGetPrimitiveHash(w, r, strings.TrimSuffix(path, "/hash"))
+		return
+	}
+
+	// Historical read: GET /api/primitives/{path...}?at={commitHash}
+	if at := r.URL.Query().Get("at"); at != "" {
+		s.handleGetPrimitiveAtCommit(w, r, path, at)
+		return
+	}
+
+	// Normal path: current state from SQLite index.
 	p, err := s.idx.Get(r.Context(), path)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -138,6 +165,65 @@ func (s *Server) handleGetPrimitive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toAPIPrimitive(*p))
+}
+
+// handleGetPrimitiveAtCommit serves GET /api/primitives/{path...}?at={hash}.
+// It reads the manifest directly from the Git object store at the given commit,
+// bypassing the SQLite index (which only holds current state). The response
+// has the same shape as a normal primitive response, with the additional
+// commit_hash field set to the requested hash.
+func (s *Server) handleGetPrimitiveAtCommit(w http.ResponseWriter, r *http.Request, path, commitHash string) {
+	if s.writer == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			fmt.Errorf("historical reads unavailable: data directory is not a git repository"))
+		return
+	}
+
+	pm, err := s.writer.ReadManifestAtCommit(path, commitHash)
+	if err != nil {
+		if errors.Is(err, gitpkg.ErrNotFound) {
+			writeError(w, http.StatusNotFound,
+				fmt.Errorf("not found: %s at commit %s", path, commitHash))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	resp := parsedToAPI(pm)
+	resp.CommitHash = commitHash
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleGetPrimitiveHash serves GET /api/primitives/{path...}/hash.
+// It validates that the primitive exists in the current index, then returns
+// the HEAD commit hash. The Shell stores this hash when adding a catalogue
+// item to inventory, so it can later retrieve the exact version via ?at=.
+func (s *Server) handleGetPrimitiveHash(w http.ResponseWriter, r *http.Request, path string) {
+	if s.writer == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			fmt.Errorf("git operations unavailable: data directory is not a git repository"))
+		return
+	}
+
+	// Confirm the primitive exists before returning a hash.
+	p, err := s.idx.Get(r.Context(), path)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if p == nil {
+		writeError(w, http.StatusNotFound, fmt.Errorf("not found: %s", path))
+		return
+	}
+
+	hash, err := s.writer.HeadHash()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("resolve HEAD: %w", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"commit_hash": hash})
 }
 
 // handleSearch handles GET /api/search?q=<query>.
@@ -411,6 +497,9 @@ type apiPrimitive struct {
 	Properties    json.RawMessage `json:"properties,omitempty"`
 	ParentProject string          `json:"parent_project,omitempty"`
 	Manifest      json.RawMessage `json:"manifest"`
+	// CommitHash is the Git commit hash this primitive was read from.
+	// Only set when the request used the ?at= query parameter.
+	CommitHash    string          `json:"commit_hash,omitempty"`
 }
 
 // apiRelationship is the JSON shape returned for a single relationship row.

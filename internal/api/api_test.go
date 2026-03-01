@@ -318,3 +318,159 @@ func TestAuth_PublicReads_PostWithoutKey_Returns401(t *testing.T) {
 		t.Errorf("expected 401 for POST without key (public-reads), got %d", resp.StatusCode)
 	}
 }
+
+// newGitTestServer creates a Server backed by a temp git repository with one
+// committed manifest. Returns the test server, the HEAD commit hash, and the
+// relative manifest path. The index is populated directly; no watcher is started.
+func newGitTestServer(t *testing.T) (*httptest.Server, string, string) {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+
+	w, err := gitpkg.NewWriter(tmpDir)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+
+	const manifestPath = "tools/wing-divider/manifest.json"
+	const manifest = `{
+		"id":          "tool-wd-001",
+		"type":        "tool",
+		"name":        "Wing Divider",
+		"slug":        "wing-divider",
+		"created":     "2026-01-01T00:00:00Z",
+		"modified":    "2026-01-01T00:00:00Z",
+		"description": "Marks parallel stitch lines on leather",
+		"tags":        ["leather", "marking"]
+	}`
+
+	if err := w.WriteManifest(manifestPath, []byte(manifest), "add wing divider"); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+
+	hash, err := w.HeadHash()
+	if err != nil {
+		t.Fatalf("HeadHash: %v", err)
+	}
+
+	idx, err := index.Open(":memory:")
+	if err != nil {
+		t.Fatalf("index.Open: %v", err)
+	}
+	t.Cleanup(func() { idx.Close() })
+
+	ctx := context.Background()
+	m := gitpkg.Manifest{Path: manifestPath, Raw: json.RawMessage(manifest)}
+	pm, err := m.Parse()
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if err := idx.IndexManifest(ctx, pm); err != nil {
+		t.Fatalf("IndexManifest: %v", err)
+	}
+	if err := idx.RebuildFTS(ctx); err != nil {
+		t.Fatalf("RebuildFTS: %v", err)
+	}
+
+	srv := NewServer(idx, w, "" /* no auth */, false)
+	return httptest.NewServer(srv), hash, manifestPath
+}
+
+// — GET /api/primitives/{path}?at= ———————————————————————————————————————————
+
+func TestGetPrimitiveAtCommit_ReturnsCorrectData(t *testing.T) {
+	srv, commitHash, path := newGitTestServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/"+path+"?at="+commitHash)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var p apiPrimitive
+	decodeJSON(t, resp, &p)
+
+	if p.Name != "Wing Divider" {
+		t.Errorf("Name: got %q, want %q", p.Name, "Wing Divider")
+	}
+	if p.CommitHash != commitHash {
+		t.Errorf("CommitHash: got %q, want %q", p.CommitHash, commitHash)
+	}
+}
+
+func TestGetPrimitiveAtCommit_BadCommitHash_Returns404(t *testing.T) {
+	srv, _, path := newGitTestServer(t)
+	defer srv.Close()
+
+	const badHash = "0000000000000000000000000000000000000000"
+	resp := get(t, srv, "/api/primitives/"+path+"?at="+badHash)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestGetPrimitiveAtCommit_UnknownPath_Returns404(t *testing.T) {
+	srv, commitHash, _ := newGitTestServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/tools/nonexistent/manifest.json?at="+commitHash)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestGetPrimitiveAtCommit_NoWriter_Returns503(t *testing.T) {
+	// newTestServer wires writer=nil.
+	srv := newTestServer(t, "", false)
+	defer srv.Close()
+
+	const hash = "0000000000000000000000000000000000000000"
+	resp := get(t, srv, "/api/primitives/tools/stitching-chisel/manifest.json?at="+hash)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", resp.StatusCode)
+	}
+}
+
+// — GET /api/primitives/{path}/hash ——————————————————————————————————————————
+
+func TestGetPrimitiveHash_ReturnsCommitHash(t *testing.T) {
+	srv, _, path := newGitTestServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/"+path+"/hash")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var result map[string]string
+	decodeJSON(t, resp, &result)
+
+	h, ok := result["commit_hash"]
+	if !ok {
+		t.Fatal("response missing commit_hash field")
+	}
+	if len(h) != 40 {
+		t.Errorf("expected 40-char hash, got %d chars: %q", len(h), h)
+	}
+}
+
+func TestGetPrimitiveHash_UnknownPath_Returns404(t *testing.T) {
+	srv, _, _ := newGitTestServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/tools/nonexistent/manifest.json/hash")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestGetPrimitiveHash_NoWriter_Returns503(t *testing.T) {
+	// newTestServer wires writer=nil.
+	srv := newTestServer(t, "", false)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives/tools/stitching-chisel/manifest.json/hash")
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", resp.StatusCode)
+	}
+}
