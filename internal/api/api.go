@@ -102,11 +102,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleListPrimitives handles GET /api/primitives[?type=<type>].
+// handleListPrimitives handles GET /api/primitives[?type=<type>][&workshop=<slug>].
 func (s *Server) handleListPrimitives(w http.ResponseWriter, r *http.Request) {
-	typeFilter := r.URL.Query().Get("type")
+	typeFilter   := r.URL.Query().Get("type")
+	workshopSlug := r.URL.Query().Get("workshop")
 
-	primitives, err := s.idx.List(r.Context(), typeFilter)
+	primitives, err := s.idx.List(r.Context(), typeFilter, workshopSlug)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

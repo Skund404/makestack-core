@@ -89,6 +89,19 @@ func main() {
 		log.Printf("warning: rebuild FTS: %v", err)
 	}
 
+	// — Index workshops ———————————————————————————————————————————————————————
+	workshops, err := gitpkg.ReadWorkshops(*dataDir)
+	if err != nil {
+		log.Printf("warning: read workshops: %v", err)
+	} else {
+		for _, ws := range workshops {
+			if err := idx.IndexWorkshop(ctx, &ws); err != nil {
+				log.Printf("warning: index workshop %s: %v", ws.Slug, err)
+			}
+		}
+		log.Printf("indexed %d workshop(s)", len(workshops))
+	}
+
 	// — Start file watcher ——————————————————————————————————————————————————
 	w, err := watcher.New(*dataDir, idx)
 	if err != nil {

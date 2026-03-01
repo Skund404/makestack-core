@@ -50,11 +50,29 @@ var schemaStmts = []string{
 		content=primitives, content_rowid=rowid
 	)`,
 
+	`CREATE TABLE IF NOT EXISTS workshops (
+		id          TEXT PRIMARY KEY,
+		slug        TEXT NOT NULL UNIQUE,
+		name        TEXT NOT NULL,
+		description TEXT,
+		path        TEXT NOT NULL,
+		created     TEXT,
+		modified    TEXT
+	)`,
+
+	`CREATE TABLE IF NOT EXISTS workshop_members (
+		workshop_slug  TEXT NOT NULL,
+		primitive_path TEXT NOT NULL,
+		PRIMARY KEY (workshop_slug, primitive_path),
+		FOREIGN KEY (workshop_slug) REFERENCES workshops(slug)
+	)`,
+
 	`CREATE INDEX IF NOT EXISTS idx_primitives_type      ON primitives(type)`,
 	`CREATE INDEX IF NOT EXISTS idx_primitives_parent    ON primitives(parent_project)`,
 	`CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_path)`,
 	`CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_path)`,
 	`CREATE INDEX IF NOT EXISTS idx_relationships_type   ON relationships(relationship_type)`,
+	`CREATE INDEX IF NOT EXISTS idx_wm_slug              ON workshop_members(workshop_slug)`,
 }
 
 // Primitive holds all indexed fields for a single makestack primitive.
@@ -112,6 +130,47 @@ func Open(path string) (*Index, error) {
 // Close closes the underlying database connection.
 func (idx *Index) Close() error {
 	return idx.db.Close()
+}
+
+// IndexWorkshop upserts a workshop row and atomically replaces its full member
+// list. This ensures the stored membership always matches the workshop.json on
+// disk exactly — no stale paths linger after an edit.
+func (idx *Index) IndexWorkshop(ctx context.Context, w *gitpkg.Workshop) error {
+	tx, err := idx.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO workshops (id, slug, name, description, path, created, modified)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(slug) DO UPDATE SET
+			id=excluded.id, name=excluded.name, description=excluded.description,
+			path=excluded.path, created=excluded.created, modified=excluded.modified`,
+		w.ID, w.Slug, w.Name, w.Description, w.Path, w.Created, w.Modified,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert workshop %s: %w", w.Slug, err)
+	}
+
+	// Replace member list — delete then re-insert is simplest given the small set sizes.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM workshop_members WHERE workshop_slug = ?`, w.Slug,
+	); err != nil {
+		return fmt.Errorf("clear workshop_members for %s: %w", w.Slug, err)
+	}
+
+	for _, path := range w.Primitives {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO workshop_members (workshop_slug, primitive_path) VALUES (?, ?)`,
+			w.Slug, path,
+		); err != nil {
+			return fmt.Errorf("insert workshop_member %s→%s: %w", w.Slug, path, err)
+		}
+	}
+
+	return tx.Commit()
 }
 
 // UpsertFull inserts or updates a primitive together with its relationships
@@ -210,28 +269,52 @@ func (idx *Index) RebuildFTS(ctx context.Context) error {
 	return err
 }
 
-// List returns all primitives ordered by type then name.
-// If typeFilter is non-empty, only primitives of that type are returned.
-func (idx *Index) List(ctx context.Context, typeFilter string) ([]Primitive, error) {
+// List returns primitives ordered by type then name.
+// typeFilter and workshopSlug are each optional (pass "" to skip).
+// They can be combined: e.g. typeFilter="tool" + workshopSlug="leatherwork"
+// returns only tools that belong to that workshop.
+// An unknown workshopSlug returns an empty list rather than an error.
+func (idx *Index) List(ctx context.Context, typeFilter, workshopSlug string) ([]Primitive, error) {
+	const cols = `id, type, name, slug, path, created, modified,
+	              description, tags, cloned_from, properties, parent_project, manifest`
+
 	var (
 		rows *sql.Rows
 		err  error
 	)
-	if typeFilter != "" {
-		rows, err = idx.db.QueryContext(ctx, `
-			SELECT id, type, name, slug, path, created, modified,
-			       description, tags, cloned_from, properties, parent_project, manifest
-			FROM primitives
-			WHERE type = ?
-			ORDER BY name`,
+
+	switch {
+	case typeFilter == "" && workshopSlug == "":
+		rows, err = idx.db.QueryContext(ctx,
+			`SELECT `+cols+` FROM primitives ORDER BY type, name`)
+
+	case typeFilter != "" && workshopSlug == "":
+		rows, err = idx.db.QueryContext(ctx,
+			`SELECT `+cols+` FROM primitives WHERE type = ? ORDER BY name`,
 			typeFilter)
-	} else {
-		rows, err = idx.db.QueryContext(ctx, `
-			SELECT id, type, name, slug, path, created, modified,
-			       description, tags, cloned_from, properties, parent_project, manifest
-			FROM primitives
-			ORDER BY type, name`)
+
+	case typeFilter == "" && workshopSlug != "":
+		rows, err = idx.db.QueryContext(ctx,
+			`SELECT `+cols+`
+			 FROM primitives
+			 WHERE path IN (
+			     SELECT primitive_path FROM workshop_members WHERE workshop_slug = ?
+			 )
+			 ORDER BY type, name`,
+			workshopSlug)
+
+	default: // both filters set
+		rows, err = idx.db.QueryContext(ctx,
+			`SELECT `+cols+`
+			 FROM primitives
+			 WHERE type = ?
+			   AND path IN (
+			       SELECT primitive_path FROM workshop_members WHERE workshop_slug = ?
+			   )
+			 ORDER BY name`,
+			typeFilter, workshopSlug)
 	}
+
 	if err != nil {
 		return nil, fmt.Errorf("list primitives: %w", err)
 	}
