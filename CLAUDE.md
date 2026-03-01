@@ -233,7 +233,7 @@ The full specs are in the makestack-docs repo. Key documents for Core developmen
 
 ## Current State
 
-Core: MVP COMPLETE — WRITE API DONE
+Core: MVP COMPLETE — AUTH DONE
 
 - [x] Go module initialized (`github.com/makestack/makestack-core`)
 - [x] Project structure created
@@ -246,7 +246,7 @@ Core: MVP COMPLETE — WRITE API DONE
 - [x] Relationship indexing + reverse lookups — `RelationshipsFor` returns both directions
 - [x] File watcher — `internal/watcher`: fsnotify v1.9.0, recursive dir watching, 200 ms debounce, handles create/edit/delete live; recursively processes new dirs to avoid race with write API
 - [x] Test fixtures — one of each primitive type + workshop fixture
-- [ ] Authentication
+- [x] Authentication — API key via `--api-key` flag or `MAKESTACK_API_KEY` env var; `--public-reads` makes GET endpoints open; constant-time comparison; `/health` always public
 - [ ] Workshop support (scope queries by workshop)
 - [ ] JSON schema validation
 - [ ] Tests (unit + integration)
@@ -267,11 +267,10 @@ Nothing currently in progress.
 
 ## Next Steps (Priority Order)
 
-1. Authentication (API key for v0 — simplest that protects the write API)
-2. Workshop-scoped queries (`GET /api/primitives?workshop=leatherwork`)
-3. JSON schema validation on POST/PUT (validate against per-type schema)
-4. Unit + integration tests
-5. Dockerize
+1. Workshop-scoped queries (`GET /api/primitives?workshop=leatherwork`)
+2. JSON schema validation on POST/PUT (validate against per-type schema)
+3. Unit + integration tests
+4. Dockerize
 
 ---
 
@@ -293,11 +292,12 @@ Nothing currently in progress.
 - `index.IndexManifest` is the single conversion point from `git.ParsedManifest` to index rows (bulk loader and watcher both call it)
 - Write path: POST/PUT/DELETE write to Git and commit; watcher picks up change and updates index async
 - Workshop fixture format: `workshops/{slug}/workshop.json` (not manifest.json, so reader/watcher ignore it — read-only reference for now)
+- Auth: single static API key; `Authorization: Bearer <key>` or `X-API-Key: <key>`; constant-time compare; `/health` always public; `--public-reads` opens GET endpoints
 
 ## Decisions Deferred
 
 - REST vs GraphQL (REST default, reconsider if relationship queries become awkward)
-- Auth mechanism (API key simplest for v0; JWT or session for multi-user)
+- Multi-user auth (JWT or session tokens — API key is sufficient for v0 single-owner use)
 
 ---
 
@@ -335,3 +335,10 @@ Nothing currently in progress.
 - Fixed watcher `handleEvent` to recursively walk + process new directories (fixes race condition where write API creates dirs too fast for fsnotify)
 - Added `test/fixtures/workshops/leatherwork/workshop.json`
 - All write endpoints verified: POST 201 + auto fields, PUT 200, DELETE 204; all commit to Git; index updated via watcher ~200ms later
+
+### 2026-03-01 — Authentication
+- Implemented `internal/auth/auth.go`: `ValidateRequest` checks `Authorization: Bearer` or `X-API-Key` header with `subtle.ConstantTimeCompare`
+- Added `withAuth` middleware to `internal/api/api.go`; all routes protected; `/health` always public
+- `--api-key` flag overrides `MAKESTACK_API_KEY` env var; no key → warning + open access
+- `--public-reads` flag makes GET endpoints public while keeping writes protected
+- Logs auth mode at startup; all scenarios smoke-tested
