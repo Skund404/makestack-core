@@ -12,9 +12,10 @@ import (
 	"strings"
 	"time"
 
-	gitpkg "github.com/makestack/makestack-core/internal/git"
 	"github.com/makestack/makestack-core/internal/auth"
+	gitpkg "github.com/makestack/makestack-core/internal/git"
 	"github.com/makestack/makestack-core/internal/index"
+	"github.com/makestack/makestack-core/internal/schema"
 )
 
 // validPrimitiveTypes is the closed set of types the data model recognises.
@@ -245,6 +246,13 @@ func (s *Server) handleCreatePrimitive(w http.ResponseWriter, r *http.Request) {
 
 	slug := jsonString(body["slug"])
 
+	// — validate structure ————————————————————————————————————————————————
+	if errs := schema.Validate(primType, body); len(errs) > 0 {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("validation failed: %s", strings.Join(errs, "; ")))
+		return
+	}
+
 	// — write to disk and commit ——————————————————————————————————————————
 	data, err := json.MarshalIndent(body, "", "  ")
 	if err != nil {
@@ -322,6 +330,13 @@ func (s *Server) handleUpdatePrimitive(w http.ResponseWriter, r *http.Request) {
 
 	// Always stamp modified with the current time.
 	body["modified"] = jsonRaw(time.Now().UTC().Format(time.RFC3339))
+
+	// — validate structure ————————————————————————————————————————————————
+	if errs := schema.Validate(primType, body); len(errs) > 0 {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("validation failed: %s", strings.Join(errs, "; ")))
+		return
+	}
 
 	data, err := json.MarshalIndent(body, "", "  ")
 	if err != nil {
