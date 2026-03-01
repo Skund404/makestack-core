@@ -464,6 +464,82 @@ func TestGetPrimitiveHash_UnknownPath_Returns404(t *testing.T) {
 	}
 }
 
+func TestGetPrimitiveHash_ReturnsPathSpecificHash_NotRepoHead(t *testing.T) {
+	// Regression test: /hash must return the hash of the last commit that
+	// touched this specific path, not the HEAD hash of the repository.
+	// Before the fix, both primitives below returned hashB (HEAD) even though
+	// pathA was last modified at hashA.
+	tmpDir := t.TempDir()
+	w, err := gitpkg.NewWriter(tmpDir)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+
+	const pathA = "tools/wing-divider/manifest.json"
+	const mA = `{"id":"tool-wd-001","type":"tool","name":"Wing Divider","slug":"wing-divider","created":"2026-01-01T00:00:00Z","modified":"2026-01-01T00:00:00Z"}`
+	if err := w.WriteManifest(pathA, []byte(mA), "add wing divider"); err != nil {
+		t.Fatalf("WriteManifest A: %v", err)
+	}
+	hashA, _ := w.HeadHash()
+
+	const pathB = "tools/awl/manifest.json"
+	const mB = `{"id":"tool-awl-001","type":"tool","name":"Awl","slug":"awl","created":"2026-01-01T00:00:00Z","modified":"2026-01-01T00:00:00Z"}`
+	if err := w.WriteManifest(pathB, []byte(mB), "add awl"); err != nil {
+		t.Fatalf("WriteManifest B: %v", err)
+	}
+	hashB, _ := w.HeadHash()
+
+	if hashA == hashB {
+		t.Fatal("test setup: expected two distinct commits")
+	}
+
+	idx, err := index.Open(":memory:")
+	if err != nil {
+		t.Fatalf("index.Open: %v", err)
+	}
+	t.Cleanup(func() { idx.Close() })
+
+	ctx := context.Background()
+	for _, entry := range []struct{ path, raw string }{{pathA, mA}, {pathB, mB}} {
+		m := gitpkg.Manifest{Path: entry.path, Raw: json.RawMessage(entry.raw)}
+		pm, err := m.Parse()
+		if err != nil {
+			t.Fatalf("Parse %s: %v", entry.path, err)
+		}
+		if err := idx.IndexManifest(ctx, pm); err != nil {
+			t.Fatalf("IndexManifest %s: %v", entry.path, err)
+		}
+	}
+	if err := idx.RebuildFTS(ctx); err != nil {
+		t.Fatalf("RebuildFTS: %v", err)
+	}
+
+	srv := httptest.NewServer(NewServer(idx, w, "", false))
+	defer srv.Close()
+
+	// pathA was last modified at hashA (not HEAD). Its /hash must not return hashB.
+	respA := get(t, srv, "/api/primitives/"+pathA+"/hash")
+	if respA.StatusCode != http.StatusOK {
+		t.Fatalf("pathA /hash: expected 200, got %d\n%s", respA.StatusCode, readBody(t, respA))
+	}
+	var resultA map[string]string
+	decodeJSON(t, respA, &resultA)
+	if resultA["commit_hash"] != hashA {
+		t.Errorf("pathA commit_hash: got %q, want %q (not HEAD %q)", resultA["commit_hash"], hashA, hashB)
+	}
+
+	// pathB is also HEAD here, but the important invariant is path-specificity.
+	respB := get(t, srv, "/api/primitives/"+pathB+"/hash")
+	if respB.StatusCode != http.StatusOK {
+		t.Fatalf("pathB /hash: expected 200, got %d\n%s", respB.StatusCode, readBody(t, respB))
+	}
+	var resultB map[string]string
+	decodeJSON(t, respB, &resultB)
+	if resultB["commit_hash"] != hashB {
+		t.Errorf("pathB commit_hash: got %q, want %q", resultB["commit_hash"], hashB)
+	}
+}
+
 func TestGetPrimitiveHash_NoWriter_Returns503(t *testing.T) {
 	// newTestServer wires writer=nil.
 	srv := newTestServer(t, "", false)

@@ -225,9 +225,9 @@ func (s *Server) handleGetPrimitiveHash(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	hash, err := s.writer.HeadHash()
+	hash, err := s.writer.LastCommitHashForPath(path)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("resolve HEAD: %w", err))
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("resolve last commit for %s: %w", path, err))
 		return
 	}
 

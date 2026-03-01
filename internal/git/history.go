@@ -73,6 +73,23 @@ func (w *Writer) HeadHash() (string, error) {
 	return ref.Hash().String(), nil
 }
 
+// LastCommitHashForPath returns the hash of the most recent commit that
+// touched manifestPath as a 40-character hex string. This is the correct hash
+// for the Shell's inventory pointer model: it identifies the exact version of
+// a catalogue entry, not merely the latest commit in the repository.
+//
+// Returns ErrNotFound (wrapped) when no commit has ever touched manifestPath.
+func (w *Writer) LastCommitHashForPath(manifestPath string) (string, error) {
+	commits, _, err := w.CommitHistoryForPath(manifestPath, 1, 0)
+	if err != nil {
+		return "", err
+	}
+	if len(commits) == 0 {
+		return "", fmt.Errorf("%w: no commits found for path %s", ErrNotFound, manifestPath)
+	}
+	return commits[0].Hash, nil
+}
+
 // CommitInfo holds the metadata for a single Git commit, used by the
 // /history endpoint to describe each version of a primitive.
 type CommitInfo struct {

@@ -316,6 +316,55 @@ func TestCommitHistoryForPath_UnrelatedPath_NotIncluded(t *testing.T) {
 	}
 }
 
+// — LastCommitHashForPath —————————————————————————————————————————————————————
+
+func TestLastCommitHashForPath_ReturnsPathSpecificHash(t *testing.T) {
+	w, hashA, pathA := newWriterWithCommit(t)
+
+	// Commit a second, unrelated file. HEAD advances, but pathA's last-touched
+	// commit must not change.
+	const pathB = "tools/awl/manifest.json"
+	const mB = `{"id":"tool-awl-001","type":"tool","name":"Awl","slug":"awl","created":"2026-01-01T00:00:00Z","modified":"2026-01-01T00:00:00Z"}`
+	if err := w.WriteManifest(pathB, []byte(mB), "add awl"); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+	hashB, _ := w.HeadHash()
+
+	if hashA == hashB {
+		t.Fatal("test setup: expected two distinct commits")
+	}
+
+	// pathA was last modified at hashA, not HEAD.
+	got, err := w.LastCommitHashForPath(pathA)
+	if err != nil {
+		t.Fatalf("LastCommitHashForPath(pathA): %v", err)
+	}
+	if got != hashA {
+		t.Errorf("pathA: got %q, want %q (not HEAD %q)", got, hashA, hashB)
+	}
+
+	// pathB was last modified at HEAD (hashB).
+	got2, err := w.LastCommitHashForPath(pathB)
+	if err != nil {
+		t.Fatalf("LastCommitHashForPath(pathB): %v", err)
+	}
+	if got2 != hashB {
+		t.Errorf("pathB: got %q, want %q", got2, hashB)
+	}
+}
+
+func TestLastCommitHashForPath_UnknownPath_ReturnsErrNotFound(t *testing.T) {
+	w, _, _ := newWriterWithCommit(t)
+
+	_, err := w.LastCommitHashForPath("tools/nonexistent/manifest.json")
+	if err == nil {
+		t.Fatal("expected error for unknown path, got nil")
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound, got: %v", err)
+	}
+}
+
 // — ParentHash ————————————————————————————————————————————————————————————————
 
 func TestParentHash_ReturnsParentOfSecondCommit(t *testing.T) {
