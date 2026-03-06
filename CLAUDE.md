@@ -245,7 +245,7 @@ The full specs are in the makestack-docs repo. Key documents for Core developmen
 
 ## Current State
 
-Core: **FEATURE COMPLETE FOR v0**
+Core: **FEATURE COMPLETE FOR v0.2**
 
 - [x] Go module initialized (`github.com/makestack/makestack-core`)
 - [x] Project structure created
@@ -263,11 +263,46 @@ Core: **FEATURE COMPLETE FOR v0**
 - [x] JSON schema validation — `internal/schema`: structural type checks on POST/PUT; common (description/tags/relationships) + type-specific (steps, parent_project); all errors returned at once; 400 on failure
 - [x] Tests — `internal/git`, `internal/index`, `internal/schema`, `internal/api` all covered; 100% pass
 
+### v0.2 — Multi-root federation + config-driven indexing
+
+- [x] `internal/parser/` — `Config`, `DefaultConfig()`, `LoadConfig(path)` with missing-file fallback; render section stored verbatim
+- [x] `internal/federation/` — `Root`, `Config`, `LoadConfig(dataDir)` with single-root default; validation (unique slugs, exactly one primary, all paths exist)
+- [x] SQLite schema — `root_slug TEXT NOT NULL DEFAULT 'primary'` added to `primitives` and `relationships`; FTS5 updated to include `root_slug`; `idx_primitives_root` index added; migration runs on `Open` for existing databases
+- [x] `index.List` — new `rootFilter` parameter; 4 SQL branches (type+root, type-only, root-only, none)
+- [x] `index.IndexManifest` — new `rootSlug` parameter; all callers updated
+- [x] `index.CountByRoot` — per-root primitive counts for `/api/roots`
+- [x] `index.Exists` — thin bool wrapper around `Get` (from v0.1 slug-conflict fix)
+- [x] Watcher — `New(dataDir, rootSlug, manifestFilename, idx)`: stamps primary root slug on indexed primitives; configurable manifest filename; watches primary root only
+- [x] Bulk loader (`main.go`) — loads federation config, loads parser config per root, calls `loadRootManifests` (walks parser-config-listed directories, prefixes non-primary paths with root slug), indexes all roots
+- [x] API — `GET /api/roots`, `GET /api/parser-config/{slug}`, `?root=` filter on `GET /api/primitives`, write guards (400) on PUT/DELETE for non-primary roots
+- [x] `api.WithFederation` — chainable setter; existing `NewServer` signature unchanged; all existing tests pass
+
 ---
 
 ## What's In Progress
 
 Nothing currently in progress.
+
+---
+
+## v0.2 API Reference
+
+### New endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/roots` | List all configured roots with slug, trust, primary flag, primitive count |
+| GET | `/api/parser-config/{slug}` | Return parser config for a root (default config if none on disk) |
+
+### Extended endpoints
+
+| Method | Path | Change |
+|--------|------|--------|
+| GET | `/api/primitives?root=<slug>` | New optional `root` filter; no param = all roots |
+
+### Write guards (v0.2)
+
+PUT and DELETE to paths in non-primary roots return `400 Bad Request` with a clear message. Writes always target the primary root only.
 
 ---
 
@@ -279,11 +314,27 @@ Nothing currently in progress.
 
 ## Next Steps (Priority Order)
 
-1. Core is feature-complete for v0 — all endpoints implemented and tested
+1. Core is feature-complete for v0.2 — all endpoints implemented and tested
 2. Next work moves to makestack-app (Shell): Python/FastAPI backend + React frontend
 3. The Shell will be the only client of Core, proxying all catalogue access for modules
+4. Deferred federation features: scheduled sync for federated roots, remote repo cloning
 
 ---
+
+## Decisions Made (v0.2 additions)
+
+- Federation config lives at `.makestack/federation.json` inside the primary data dir; absent = single-root mode (backwards compatible)
+- Single-root default: one root with slug "primary", path = `--data` dir, trust = "personal", primary = true
+- Parser config lives at `makestack-parser.json` in each root's directory; absent = default Makestack conventions
+- Non-primary root paths are prefixed with `root_slug/` in the index (e.g. `supplier/materials/foo/manifest.json`)
+- Primary root paths are unchanged (no prefix) for full backwards compatibility
+- `root_slug` column defaults to "primary" in the database; migration is idempotent (checks column existence before ALTER TABLE)
+- FTS5 table includes `root_slug` so full-text search can find primitives by origin
+- Watcher watches the primary root only; federated roots are read-only and not watched (scheduled sync deferred)
+- `api.WithFederation` is a chainable setter on Server; `NewServer` signature is unchanged so all existing tests and callers need zero changes
+- Write guard for federated roots: PUT/DELETE handlers return 400 if `existing.RootSlug != "primary"` and `fedConfig != nil`
+- Bulk loader moved to `loadRootManifests` in `main.go` (not in the git package); git package stays config-unaware per package-boundary rules
+- `BuildPrimitivePath` (from v0.1 slug fix) is the forward-compatibility seam for path construction; federation uses non-empty origin in v0.2
 
 ## Decisions Made
 
@@ -400,6 +451,22 @@ Nothing currently in progress.
 - README: added `.makestack/` to data repo layout with note that it holds Shell config but is not indexed as primitives
 - CLAUDE.md: updated Next Steps, corrected stale `/hash` description in Decisions Made
 - `go test -race ./...` — all packages pass
+
+### 2026-03-06 — v0.2: Multi-Root Federation + Config-Driven Indexing
+
+- Created `internal/parser/`: `Config`, `DefaultConfig()`, `LoadConfig` (missing-file fallback to default, partial-config merging)
+- Created `internal/federation/`: `Root`, `Config`, `LoadConfig` (single-root default when no federation.json), full validation
+- Updated SQLite schema: `root_slug` column in `primitives` and `relationships`, `root_slug` in FTS5, `idx_primitives_root` index, idempotent migration in `Open`
+- Updated `index.List` signature: added `rootFilter` param with 4 SQL branches
+- Updated `index.IndexManifest` signature: added `rootSlug` param; all callers updated
+- Added `index.CountByRoot` for per-root primitive counts
+- Updated `watcher.New` signature: added `rootSlug` and `manifestFilename` params; stamps root slug on all indexed primitives; watches primary root only
+- Rewrote `main.go`: loads federation config + parser configs, multi-root bulk loader via `loadRootManifests`, prefixes non-primary paths with root slug, wires writer and watcher to primary root only
+- Added `api.WithFederation` chainable setter; `NewServer` signature unchanged
+- Added `GET /api/roots`, `GET /api/parser-config/{slug}`, `?root=` filter on `GET /api/primitives`
+- Added write guards (400) for PUT/DELETE on non-primary root primitives
+- All existing tests pass; 15 new integration tests added across `internal/api`, `internal/index`, `internal/parser`, `internal/federation`
+- `go test -race ./...` — all packages green
 
 ### 2026-03-01 — Version-Specific Primitive Retrieval
 - Added `internal/git/history.go`: `ReadManifestAtCommit(path, commitHash)` reads a manifest from the Git object store at any past commit; `HeadHash()` returns the current HEAD hash as a 40-char hex string; `ErrNotFound` sentinel (wraps `plumbing.ErrObjectNotFound` / `object.ErrFileNotFound`) so callers don't import go-git plumbing packages

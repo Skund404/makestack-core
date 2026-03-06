@@ -7,11 +7,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/makestack/makestack-core/internal/federation"
 	gitpkg "github.com/makestack/makestack-core/internal/git"
 	"github.com/makestack/makestack-core/internal/index"
+	"github.com/makestack/makestack-core/internal/parser"
 )
 
 // fixturesDir points at the shared test fixtures relative to this file.
@@ -44,7 +48,7 @@ func newTestServer(t *testing.T, apiKey string, publicReads bool) *httptest.Serv
 		if err != nil {
 			continue // skip invalid fixtures
 		}
-		if err := idx.IndexManifest(ctx, pm); err != nil {
+		if err := idx.IndexManifest(ctx, pm, "primary"); err != nil {
 			t.Fatalf("IndexManifest %s: %v", pm.Path, err)
 		}
 	}
@@ -367,7 +371,7 @@ func newGitTestServer(t *testing.T) (*httptest.Server, string, string) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if err := idx.IndexManifest(ctx, pm); err != nil {
+	if err := idx.IndexManifest(ctx, pm, "primary"); err != nil {
 		t.Fatalf("IndexManifest: %v", err)
 	}
 	if err := idx.RebuildFTS(ctx); err != nil {
@@ -508,7 +512,7 @@ func TestGetPrimitiveHash_ReturnsPathSpecificHash_NotRepoHead(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Parse %s: %v", entry.path, err)
 		}
-		if err := idx.IndexManifest(ctx, pm); err != nil {
+		if err := idx.IndexManifest(ctx, pm, "primary"); err != nil {
 			t.Fatalf("IndexManifest %s: %v", entry.path, err)
 		}
 	}
@@ -616,7 +620,7 @@ func newGitTestServer2(t *testing.T) (*httptest.Server, string, string, string) 
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if err := idx.IndexManifest(ctx, pm); err != nil {
+	if err := idx.IndexManifest(ctx, pm, "primary"); err != nil {
 		t.Fatalf("IndexManifest: %v", err)
 	}
 	if err := idx.RebuildFTS(ctx); err != nil {
@@ -907,7 +911,7 @@ func seedIndex(t *testing.T, idx *index.Index, primType, slug string) {
 	if err != nil {
 		t.Fatalf("seedIndex Parse(%s/%s): %v", primType, slug, err)
 	}
-	if err := idx.IndexManifest(ctx, pm); err != nil {
+	if err := idx.IndexManifest(ctx, pm, "primary"); err != nil {
 		t.Fatalf("seedIndex IndexManifest(%s/%s): %v", primType, slug, err)
 	}
 }
@@ -1033,5 +1037,342 @@ func TestCreatePrimitive_SameSlugDifferentTypes_NoConflict(t *testing.T) {
 	}
 	if p.Path != "materials/foo/manifest.json" {
 		t.Errorf("Path: got %q, want %q", p.Path, "materials/foo/manifest.json")
+	}
+}
+
+// — Multi-root / federation integration tests —————————————————————————————————
+
+// newMultiRootServer sets up a Server with two roots:
+//   - "primary": personal, read-write, contains a wing-divider tool
+//   - "supplier": supplier, read-only, contains a hide-splitter material
+//
+// Returns the test server, the primary git Writer (for write endpoint tests),
+// and the in-memory index (for direct inspection).
+func newMultiRootServer(t *testing.T) (*httptest.Server, *index.Index) {
+	t.Helper()
+
+	// Primary root: real git repo so write endpoints work.
+	primaryDir := t.TempDir()
+	w, err := gitpkg.NewWriter(primaryDir)
+	if err != nil {
+		t.Fatalf("NewWriter(primary): %v", err)
+	}
+
+	// Write a tool into the primary root's git repo.
+	const primaryManPath = "tools/wing-divider/manifest.json"
+	const primaryMan = `{"id":"wd-001","type":"tool","name":"Wing Divider","slug":"wing-divider","created":"2026-01-01T00:00:00Z","modified":"2026-01-01T00:00:00Z"}`
+	if err := w.WriteManifest(primaryManPath, []byte(primaryMan), "add wing divider"); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+
+	// Supplier root: plain directory, no git needed (read-only).
+	supplierDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(supplierDir, "materials", "hide-splitter"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	const supplierMan = `{"id":"hs-001","type":"material","name":"Hide Splitter","slug":"hide-splitter","created":"2026-01-01T00:00:00Z","modified":"2026-01-01T00:00:00Z"}`
+	if err := os.WriteFile(
+		filepath.Join(supplierDir, "materials", "hide-splitter", "manifest.json"),
+		[]byte(supplierMan), 0o644,
+	); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Build the index directly (no watcher needed for tests).
+	idx, err := index.Open(":memory:")
+	if err != nil {
+		t.Fatalf("index.Open: %v", err)
+	}
+	t.Cleanup(func() { idx.Close() })
+
+	ctx := context.Background()
+
+	// Index primary root primitive.
+	pm, _ := gitpkg.Manifest{Path: primaryManPath, Raw: json.RawMessage(primaryMan)}.Parse()
+	if err := idx.IndexManifest(ctx, pm, "primary"); err != nil {
+		t.Fatalf("IndexManifest primary: %v", err)
+	}
+
+	// Index supplier root primitive (path prefixed with root slug).
+	const supplierPath = "supplier/materials/hide-splitter/manifest.json"
+	pm2, _ := gitpkg.Manifest{Path: supplierPath, Raw: json.RawMessage(supplierMan)}.Parse()
+	if err := idx.IndexManifest(ctx, pm2, "supplier"); err != nil {
+		t.Fatalf("IndexManifest supplier: %v", err)
+	}
+
+	if err := idx.RebuildFTS(ctx); err != nil {
+		t.Fatalf("RebuildFTS: %v", err)
+	}
+
+	// Build federation and parser configs.
+	fedCfg := &federation.Config{
+		Version: "1",
+		Roots: []federation.Root{
+			{Slug: "primary", Path: primaryDir, Trust: federation.TrustPersonal, Primary: true},
+			{Slug: "supplier", Path: supplierDir, Trust: federation.TrustSupplier, Primary: false},
+		},
+	}
+	parserCfgs := map[string]*parser.Config{
+		"primary":  parser.DefaultConfig(),
+		"supplier": parser.DefaultConfig(),
+	}
+
+	srv := NewServer(idx, w, "", false).WithFederation(fedCfg, parserCfgs)
+	return httptest.NewServer(srv), idx
+}
+
+func TestListRoots_ReturnsBothRoots(t *testing.T) {
+	srv, _ := newMultiRootServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/roots")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var result struct {
+		Roots []apiRoot `json:"roots"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if len(result.Roots) != 2 {
+		t.Fatalf("expected 2 roots, got %d", len(result.Roots))
+	}
+
+	slugs := map[string]bool{}
+	for _, r := range result.Roots {
+		slugs[r.Slug] = true
+	}
+	if !slugs["primary"] || !slugs["supplier"] {
+		t.Errorf("expected slugs {primary, supplier}, got %v", slugs)
+	}
+}
+
+func TestListRoots_PrimitiveCounts(t *testing.T) {
+	srv, _ := newMultiRootServer(t)
+	defer srv.Close()
+
+	var result struct {
+		Roots []apiRoot `json:"roots"`
+	}
+	decodeJSON(t, get(t, srv, "/api/roots"), &result)
+
+	for _, r := range result.Roots {
+		switch r.Slug {
+		case "primary":
+			if r.PrimitiveCount != 1 {
+				t.Errorf("primary PrimitiveCount: got %d, want 1", r.PrimitiveCount)
+			}
+			if !r.Primary {
+				t.Error("primary root must have Primary=true")
+			}
+		case "supplier":
+			if r.PrimitiveCount != 1 {
+				t.Errorf("supplier PrimitiveCount: got %d, want 1", r.PrimitiveCount)
+			}
+			if r.Primary {
+				t.Error("supplier root must have Primary=false")
+			}
+		}
+	}
+}
+
+func TestListRoots_SingleRootMode_ReturnsSyntheticPrimary(t *testing.T) {
+	// newTestServer has no federation config (nil) — single-root mode.
+	srv := newTestServer(t, "", false)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/roots")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var result struct {
+		Roots []apiRoot `json:"roots"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if len(result.Roots) != 1 {
+		t.Fatalf("expected 1 root in single-root mode, got %d", len(result.Roots))
+	}
+	if result.Roots[0].Slug != "primary" {
+		t.Errorf("slug: got %q, want %q", result.Roots[0].Slug, "primary")
+	}
+}
+
+func TestListPrimitives_RootFilter_SupplierOnly(t *testing.T) {
+	srv, _ := newMultiRootServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/primitives?root=supplier")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var result []apiPrimitive
+	decodeJSON(t, resp, &result)
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 supplier primitive, got %d", len(result))
+	}
+	if result[0].Name != "Hide Splitter" {
+		t.Errorf("Name: got %q, want %q", result[0].Name, "Hide Splitter")
+	}
+}
+
+func TestListPrimitives_NoRootFilter_ReturnsBothRoots(t *testing.T) {
+	srv, _ := newMultiRootServer(t)
+	defer srv.Close()
+
+	var result []apiPrimitive
+	decodeJSON(t, get(t, srv, "/api/primitives"), &result)
+
+	if len(result) != 2 {
+		t.Errorf("expected 2 primitives (all roots), got %d", len(result))
+	}
+}
+
+func TestListPrimitives_UnknownRootFilter_ReturnsEmpty(t *testing.T) {
+	srv, _ := newMultiRootServer(t)
+	defer srv.Close()
+
+	var result []apiPrimitive
+	decodeJSON(t, get(t, srv, "/api/primitives?root=does-not-exist"), &result)
+
+	if len(result) != 0 {
+		t.Errorf("expected empty list for unknown root, got %d", len(result))
+	}
+}
+
+func TestNamespaceIsolation_SameSlugDifferentRoots(t *testing.T) {
+	// Add a tool named "Wing Divider" (slug "wing-divider") in the supplier
+	// root too. Both should coexist at different paths in the index.
+	_, idx := newMultiRootServer(t)
+
+	ctx := context.Background()
+	const supplierPath = "supplier/tools/wing-divider/manifest.json"
+	const supplierMan = `{"id":"wd-sup-001","type":"tool","name":"Wing Divider","slug":"wing-divider","created":"2026-01-01T00:00:00Z","modified":"2026-01-01T00:00:00Z"}`
+	pm, _ := gitpkg.Manifest{Path: supplierPath, Raw: json.RawMessage(supplierMan)}.Parse()
+	if err := idx.IndexManifest(ctx, pm, "supplier"); err != nil {
+		t.Fatalf("IndexManifest: %v", err)
+	}
+
+	// Primary path must still be intact.
+	p1, err := idx.Get(ctx, "tools/wing-divider/manifest.json")
+	if err != nil || p1 == nil {
+		t.Fatalf("primary wing-divider missing: %v", err)
+	}
+	if p1.RootSlug != "primary" {
+		t.Errorf("p1.RootSlug: got %q, want %q", p1.RootSlug, "primary")
+	}
+
+	// Supplier path also intact with its own root slug.
+	p2, err := idx.Get(ctx, supplierPath)
+	if err != nil || p2 == nil {
+		t.Fatalf("supplier wing-divider missing: %v", err)
+	}
+	if p2.RootSlug != "supplier" {
+		t.Errorf("p2.RootSlug: got %q, want %q", p2.RootSlug, "supplier")
+	}
+}
+
+func TestWriteToFederatedRoot_PUT_Returns400(t *testing.T) {
+	srv, idx := newMultiRootServer(t)
+	defer srv.Close()
+
+	// The supplier primitive is at this path in the index.
+	const supplierPath = "supplier/materials/hide-splitter/manifest.json"
+
+	// Verify it's in the index first.
+	p, err := idx.Get(context.Background(), supplierPath)
+	if err != nil || p == nil {
+		t.Fatalf("supplier primitive not in index: %v", err)
+	}
+
+	body := `{"id":"hs-001","type":"material","name":"Hide Splitter","slug":"hide-splitter","created":"2026-01-01T00:00:00Z","modified":"2026-01-01T00:00:00Z"}`
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/api/primitives/"+supplierPath, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for write to federated root, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+func TestWriteToFederatedRoot_DELETE_Returns400(t *testing.T) {
+	srv, _ := newMultiRootServer(t)
+	defer srv.Close()
+
+	const supplierPath = "supplier/materials/hide-splitter/manifest.json"
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/api/primitives/"+supplierPath, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for delete of federated primitive, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+func TestGetParserConfig_Primary_ReturnsConfig(t *testing.T) {
+	srv, _ := newMultiRootServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/parser-config/primary")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var cfg parser.Config
+	decodeJSON(t, resp, &cfg)
+	if len(cfg.Index.Directories) == 0 {
+		t.Error("expected non-empty directories in parser config")
+	}
+}
+
+func TestGetParserConfig_Supplier_ReturnsConfig(t *testing.T) {
+	srv, _ := newMultiRootServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/parser-config/supplier")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+func TestGetParserConfig_UnknownSlug_Returns404(t *testing.T) {
+	srv, _ := newMultiRootServer(t)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/parser-config/does-not-exist")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestGetParserConfig_SingleRootMode_Primary_Returns200(t *testing.T) {
+	// newTestServer has no federation config — single-root mode.
+	srv := newTestServer(t, "", false)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/parser-config/primary")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 in single-root mode, got %d", resp.StatusCode)
+	}
+}
+
+func TestGetParserConfig_SingleRootMode_UnknownSlug_Returns404(t *testing.T) {
+	srv := newTestServer(t, "", false)
+	defer srv.Close()
+
+	resp := get(t, srv, "/api/parser-config/unknown")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown slug in single-root mode, got %d", resp.StatusCode)
 	}
 }

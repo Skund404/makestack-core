@@ -33,6 +33,7 @@ func testPrimitive(id, typ, name, slug, path string) Primitive {
 		Modified: "2026-01-01T00:00:00Z",
 		Tags:     json.RawMessage(`["test"]`),
 		Manifest: json.RawMessage(`{"id":"` + id + `","type":"` + typ + `","name":"` + name + `","slug":"` + slug + `"}`),
+		RootSlug: "primary",
 	}
 }
 
@@ -220,7 +221,7 @@ func TestList_NoFilter_ReturnsAll(t *testing.T) {
 	_ = idx.UpsertFull(ctx, testPrimitive("2", "material", "M", "m", "materials/m/manifest.json"), nil)
 	_ = idx.UpsertFull(ctx, testPrimitive("3", "technique","X", "x", "techniques/x/manifest.json"),nil)
 
-	all, err := idx.List(ctx, "")
+	all, err := idx.List(ctx, "", "")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -237,7 +238,7 @@ func TestList_TypeFilter_ReturnsSubset(t *testing.T) {
 	_ = idx.UpsertFull(ctx, testPrimitive("2", "tool",     "T2", "t2", "tools/t2/manifest.json"),   nil)
 	_ = idx.UpsertFull(ctx, testPrimitive("3", "material", "M",  "m",  "materials/m/manifest.json"),nil)
 
-	tools, err := idx.List(ctx, "tool")
+	tools, err := idx.List(ctx, "tool", "")
 	if err != nil {
 		t.Fatalf("List(tool): %v", err)
 	}
@@ -342,7 +343,7 @@ func TestIndexManifest_FullPipeline(t *testing.T) {
 		Raw: json.RawMessage(`{"id":"tec-001","type":"technique","name":"Saddle Stitching","slug":"saddle-stitching"}`),
 	}
 
-	if err := idx.IndexManifest(ctx, pm); err != nil {
+	if err := idx.IndexManifest(ctx, pm, "primary"); err != nil {
 		t.Fatalf("IndexManifest: %v", err)
 	}
 
@@ -415,6 +416,107 @@ func TestConcurrentWrites(t *testing.T) {
 // should occur.
 // — Exists ————————————————————————————————————————————————————————————————————
 
+// — root_slug / federation ————————————————————————————————————————————————————
+
+func TestList_RootFilter_ReturnsOnlyMatchingRoot(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	p1 := testPrimitive("1", "tool", "Primary Tool", "primary-tool", "tools/primary-tool/manifest.json")
+	p1.RootSlug = "primary"
+	p2 := testPrimitive("2", "material", "Supplier Mat", "supplier-mat", "supplier/materials/supplier-mat/manifest.json")
+	p2.RootSlug = "supplier"
+
+	_ = idx.UpsertFull(ctx, p1, nil)
+	_ = idx.UpsertFull(ctx, p2, nil)
+
+	got, err := idx.List(ctx, "", "supplier")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 supplier primitive, got %d", len(got))
+	}
+	if got[0].RootSlug != "supplier" {
+		t.Errorf("RootSlug: got %q, want %q", got[0].RootSlug, "supplier")
+	}
+}
+
+func TestList_TypeAndRootFilter_Combined(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	p1 := testPrimitive("1", "tool", "Primary Tool", "pt", "tools/pt/manifest.json")
+	p1.RootSlug = "primary"
+	p2 := testPrimitive("2", "tool", "Supplier Tool", "st", "supplier/tools/st/manifest.json")
+	p2.RootSlug = "supplier"
+	p3 := testPrimitive("3", "material", "Supplier Mat", "sm", "supplier/materials/sm/manifest.json")
+	p3.RootSlug = "supplier"
+
+	_ = idx.UpsertFull(ctx, p1, nil)
+	_ = idx.UpsertFull(ctx, p2, nil)
+	_ = idx.UpsertFull(ctx, p3, nil)
+
+	got, err := idx.List(ctx, "tool", "supplier")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 supplier tool, got %d", len(got))
+	}
+	if got[0].ID != "2" {
+		t.Errorf("unexpected result ID %q", got[0].ID)
+	}
+}
+
+func TestCountByRoot(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	p1 := testPrimitive("1", "tool", "T1", "t1", "tools/t1/manifest.json")
+	p1.RootSlug = "primary"
+	p2 := testPrimitive("2", "tool", "T2", "t2", "tools/t2/manifest.json")
+	p2.RootSlug = "primary"
+	p3 := testPrimitive("3", "material", "M1", "m1", "supplier/materials/m1/manifest.json")
+	p3.RootSlug = "supplier"
+
+	_ = idx.UpsertFull(ctx, p1, nil)
+	_ = idx.UpsertFull(ctx, p2, nil)
+	_ = idx.UpsertFull(ctx, p3, nil)
+
+	counts, err := idx.CountByRoot(ctx)
+	if err != nil {
+		t.Fatalf("CountByRoot: %v", err)
+	}
+	if counts["primary"] != 2 {
+		t.Errorf("primary count: got %d, want 2", counts["primary"])
+	}
+	if counts["supplier"] != 1 {
+		t.Errorf("supplier count: got %d, want 1", counts["supplier"])
+	}
+}
+
+func TestGet_RootSlug_RoundTrip(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	p := testPrimitive("1", "tool", "T", "t", "tools/t/manifest.json")
+	p.RootSlug = "wickett-craig"
+	if err := idx.UpsertFull(ctx, p, nil); err != nil {
+		t.Fatalf("UpsertFull: %v", err)
+	}
+
+	got, err := idx.Get(ctx, p.Path)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.RootSlug != "wickett-craig" {
+		t.Errorf("RootSlug: got %q, want %q", got.RootSlug, "wickett-craig")
+	}
+}
+
+// — Exists ————————————————————————————————————————————————————————————————————
+
 func TestExists_AbsentThenPresent(t *testing.T) {
 	idx := openMemory(t)
 	ctx := context.Background()
@@ -477,7 +579,7 @@ func TestConcurrentReadWrite(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := idx.List(ctx, ""); err != nil {
+			if _, err := idx.List(ctx, "", ""); err != nil {
 				errs <- fmt.Errorf("reader %d: %w", i, err)
 			}
 		}()

@@ -30,31 +30,46 @@ type pendingEntry struct {
 	timer *time.Timer
 }
 
-// Watcher monitors a makestack data directory for manifest.json changes
+// Watcher monitors a makestack data directory for manifest file changes
 // and keeps the SQLite index in sync incrementally.
 type Watcher struct {
-	dataDir string
-	idx     *index.Index
-	fw      *fsnotify.Watcher
+	dataDir          string
+	rootSlug         string // index root_slug to stamp on upserted primitives
+	manifestFilename string // filename to watch for (default "manifest.json")
+	idx              *index.Index
+	fw               *fsnotify.Watcher
 
 	mu      sync.Mutex
 	pending map[string]*pendingEntry // keyed by absolute path
 }
 
 // New creates a Watcher for the given data directory and index.
+// rootSlug is the federation root slug to tag indexed primitives with
+// (use "primary" for the single-root / primary root case).
+// manifestFilename is the filename to watch for; defaults to "manifest.json"
+// when empty.
 // It immediately registers watches on every existing subdirectory so that
 // events from any depth are captured from the moment Run is called.
-func New(dataDir string, idx *index.Index) (*Watcher, error) {
+func New(dataDir string, rootSlug string, manifestFilename string, idx *index.Index) (*Watcher, error) {
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, fmt.Errorf("create fsnotify watcher: %w", err)
 	}
 
+	if manifestFilename == "" {
+		manifestFilename = "manifest.json"
+	}
+	if rootSlug == "" {
+		rootSlug = "primary"
+	}
+
 	w := &Watcher{
-		dataDir: dataDir,
-		idx:     idx,
-		fw:      fw,
-		pending: make(map[string]*pendingEntry),
+		dataDir:          dataDir,
+		rootSlug:         rootSlug,
+		manifestFilename: manifestFilename,
+		idx:              idx,
+		fw:               fw,
+		pending:          make(map[string]*pendingEntry),
 	}
 
 	if err := w.watchAllDirs(); err != nil {
@@ -125,7 +140,7 @@ func (w *Watcher) handleEvent(ctx context.Context, event fsnotify.Event) {
 					if addErr := w.fw.Add(path); addErr != nil {
 						log.Printf("watcher: watch new dir %s: %v", path, addErr)
 					}
-				} else if filepath.Base(path) == "manifest.json" {
+				} else if filepath.Base(path) == w.manifestFilename {
 					w.schedule(ctx, path) // was: w.process(ctx, path)
 				}
 				return nil
@@ -134,8 +149,8 @@ func (w *Watcher) handleEvent(ctx context.Context, event fsnotify.Event) {
 		}
 	}
 
-	// Only care about manifest.json files; ignore everything else.
-	if filepath.Base(event.Name) != "manifest.json" {
+	// Only care about configured manifest files; ignore everything else.
+	if filepath.Base(event.Name) != w.manifestFilename {
 		return
 	}
 
@@ -200,7 +215,7 @@ func (w *Watcher) upsertToIndex(ctx context.Context, rel string, data []byte) {
 		return
 	}
 
-	if err := w.idx.IndexManifest(ctx, pm); err != nil {
+	if err := w.idx.IndexManifest(ctx, pm, w.rootSlug); err != nil {
 		log.Printf("watcher: index %s: %v", rel, err)
 		return
 	}

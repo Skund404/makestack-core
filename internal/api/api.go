@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/makestack/makestack-core/internal/auth"
+	"github.com/makestack/makestack-core/internal/federation"
 	gitpkg "github.com/makestack/makestack-core/internal/git"
 	"github.com/makestack/makestack-core/internal/index"
+	"github.com/makestack/makestack-core/internal/parser"
 	"github.com/makestack/makestack-core/internal/schema"
 )
 
@@ -47,6 +49,10 @@ type Server struct {
 	writer      *gitpkg.Writer // nil when the data dir is not a git repo
 	apiKey      string         // empty = auth disabled
 	publicReads bool           // when true, GET endpoints skip auth
+
+	// Federation — both nil in single-root mode.
+	fedConfig  *federation.Config          // loaded from .makestack/federation.json
+	parserCfgs map[string]*parser.Config   // root_slug → parser config
 }
 
 // NewServer creates a Server wired to the given index, optional writer, and
@@ -64,6 +70,16 @@ func NewServer(idx *index.Index, writer *gitpkg.Writer, apiKey string, publicRea
 		publicReads: publicReads,
 	}
 	s.registerRoutes()
+	return s
+}
+
+// WithFederation attaches a federation config and per-root parser configs to
+// the server, enabling /api/roots, GET /api/parser-config/{slug}, root
+// filtering on /api/primitives, and write guards on federated roots.
+// Call this after NewServer before the first request is served.
+func (s *Server) WithFederation(fedConfig *federation.Config, parserCfgs map[string]*parser.Config) *Server {
+	s.fedConfig = fedConfig
+	s.parserCfgs = parserCfgs
 	return s
 }
 
@@ -95,6 +111,10 @@ func (s *Server) registerRoutes() {
 	// Search and relationships.
 	s.mux.HandleFunc("GET /api/search", readAuth(s.handleSearch))
 	s.mux.HandleFunc("GET /api/relationships/{path...}", readAuth(s.handleRelationships))
+
+	// Federation — roots and parser configs.
+	s.mux.HandleFunc("GET /api/roots", readAuth(s.handleListRoots))
+	s.mux.HandleFunc("GET /api/parser-config/{slug}", readAuth(s.handleGetParserConfig))
 }
 
 // withAuth wraps a handler so it requires a valid API key before proceeding.
@@ -115,11 +135,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleListPrimitives handles GET /api/primitives[?type=<type>].
+// handleListPrimitives handles GET /api/primitives[?type=<type>][?root=<slug>].
 func (s *Server) handleListPrimitives(w http.ResponseWriter, r *http.Request) {
 	typeFilter := r.URL.Query().Get("type")
+	rootFilter := r.URL.Query().Get("root")
 
-	primitives, err := s.idx.List(r.Context(), typeFilter)
+	primitives, err := s.idx.List(r.Context(), typeFilter, rootFilter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -607,6 +628,14 @@ func (s *Server) handleUpdatePrimitive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Guard: writes are restricted to the primary root.
+	if s.fedConfig != nil && existing.RootSlug != "primary" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"cannot write to federated root %q: writes are restricted to the primary root",
+			existing.RootSlug))
+		return
+	}
+
 	var body map[string]json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
@@ -686,6 +715,14 @@ func (s *Server) handleDeletePrimitive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Guard: writes are restricted to the primary root.
+	if s.fedConfig != nil && existing.RootSlug != "primary" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"cannot write to federated root %q: writes are restricted to the primary root",
+			existing.RootSlug))
+		return
+	}
+
 	commitMsg := fmt.Sprintf("delete %s: %s", existing.Type, existing.Name)
 
 	if err := s.writer.DeleteManifest(relPath, commitMsg); err != nil {
@@ -694,6 +731,79 @@ func (s *Server) handleDeletePrimitive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// — federation handlers ———————————————————————————————————————————————————————
+
+// apiRoot is the JSON shape returned for a single root in /api/roots.
+type apiRoot struct {
+	Slug           string `json:"slug"`
+	Trust          string `json:"trust"`
+	Primary        bool   `json:"primary"`
+	PrimitiveCount int    `json:"primitive_count"`
+}
+
+// handleListRoots handles GET /api/roots.
+// Returns all configured roots with slug, trust level, primary flag, and
+// primitive count. Works in both single-root and multi-root modes.
+func (s *Server) handleListRoots(w http.ResponseWriter, r *http.Request) {
+	counts, err := s.idx.CountByRoot(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	var roots []apiRoot
+	if s.fedConfig == nil {
+		// Single-root mode: synthesise a single "primary" root entry.
+		roots = []apiRoot{{
+			Slug:           "primary",
+			Trust:          string(federation.TrustPersonal),
+			Primary:        true,
+			PrimitiveCount: counts["primary"],
+		}}
+	} else {
+		for _, root := range s.fedConfig.Roots {
+			roots = append(roots, apiRoot{
+				Slug:           root.Slug,
+				Trust:          string(root.Trust),
+				Primary:        root.Primary,
+				PrimitiveCount: counts[root.Slug],
+			})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"roots": roots})
+}
+
+// handleGetParserConfig handles GET /api/parser-config/{slug}.
+// Returns the parser config for the given root slug. When no parser config
+// file was present for the root, the default Makestack conventions are
+// returned. Returns 404 for unknown slugs.
+func (s *Server) handleGetParserConfig(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	if slug == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("slug is required"))
+		return
+	}
+
+	// If parser configs are loaded, look up by slug.
+	if s.parserCfgs != nil {
+		cfg, ok := s.parserCfgs[slug]
+		if !ok {
+			writeError(w, http.StatusNotFound, fmt.Errorf("no root with slug %q", slug))
+			return
+		}
+		writeJSON(w, http.StatusOK, cfg)
+		return
+	}
+
+	// Single-root mode: only "primary" is valid.
+	if slug != "primary" {
+		writeError(w, http.StatusNotFound, fmt.Errorf("no root with slug %q", slug))
+		return
+	}
+	writeJSON(w, http.StatusOK, parser.DefaultConfig())
 }
 
 // — response types ————————————————————————————————————————————————————————————
