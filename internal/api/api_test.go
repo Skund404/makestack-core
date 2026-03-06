@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	gitpkg "github.com/makestack/makestack-core/internal/git"
@@ -829,5 +831,207 @@ func TestGetPrimitiveDiff_NoWriter_Returns503(t *testing.T) {
 	resp := get(t, srv, "/api/primitives/tools/stitching-chisel/manifest.json/diff")
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("expected 503, got %d", resp.StatusCode)
+	}
+}
+
+// — BuildPrimitivePath ————————————————————————————————————————————————————————
+
+func TestBuildPrimitivePath(t *testing.T) {
+	cases := []struct {
+		origin   string
+		primType string
+		slug     string
+		want     string
+	}{
+		// v0.1: origin is always "".
+		{"", "tool", "foo", "tools/foo/manifest.json"},
+		{"", "material", "bar", "materials/bar/manifest.json"},
+		// Federation seam: non-empty origin prefixes the path.
+		{"tandy-leather", "material", "foo", "tandy-leather/materials/foo/manifest.json"},
+		{"community-lw", "technique", "saddle-stitch", "community-lw/techniques/saddle-stitch/manifest.json"},
+	}
+	for _, tc := range cases {
+		got := BuildPrimitivePath(tc.origin, tc.primType, tc.slug)
+		if got != tc.want {
+			t.Errorf("BuildPrimitivePath(%q, %q, %q) = %q, want %q",
+				tc.origin, tc.primType, tc.slug, got, tc.want)
+		}
+	}
+}
+
+// — POST /api/primitives (slug collision) ————————————————————————————————————
+
+// postJSON is a test helper for unauthenticated POST requests with a JSON body.
+func postJSON(t *testing.T, srv *httptest.Server, path, body string) *http.Response {
+	t.Helper()
+	resp, err := http.Post(srv.URL+path, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	return resp
+}
+
+// newWriteServer creates a Server with a real git writer and an empty
+// in-memory index. Returns the test server and the index so callers can
+// pre-seed it to simulate existing primitives without needing a watcher.
+func newWriteServer(t *testing.T) (*httptest.Server, *index.Index) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	w, err := gitpkg.NewWriter(tmpDir)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	idx, err := index.Open(":memory:")
+	if err != nil {
+		t.Fatalf("index.Open: %v", err)
+	}
+	t.Cleanup(func() { idx.Close() })
+	srv := NewServer(idx, w, "", false)
+	return httptest.NewServer(srv), idx
+}
+
+// seedIndex inserts a minimal primitive into the index at the canonical path
+// for the given type and slug. Used to simulate an existing primitive without
+// needing the file watcher.
+func seedIndex(t *testing.T, idx *index.Index, primType, slug string) {
+	t.Helper()
+	ctx := context.Background()
+	path := BuildPrimitivePath("", primType, slug)
+	id := "seed-" + slug
+	rawManifest := fmt.Sprintf(
+		`{"id":%q,"type":%q,"name":%q,"slug":%q,"created":"2026-01-01T00:00:00Z","modified":"2026-01-01T00:00:00Z"}`,
+		id, primType, slug, slug,
+	)
+	m := gitpkg.Manifest{Path: path, Raw: json.RawMessage(rawManifest)}
+	pm, err := m.Parse()
+	if err != nil {
+		t.Fatalf("seedIndex Parse(%s/%s): %v", primType, slug, err)
+	}
+	if err := idx.IndexManifest(ctx, pm); err != nil {
+		t.Fatalf("seedIndex IndexManifest(%s/%s): %v", primType, slug, err)
+	}
+}
+
+func TestCreatePrimitive_AutoSlug_CollisionGetsSuffix(t *testing.T) {
+	srv, idx := newWriteServer(t)
+	defer srv.Close()
+
+	// Simulate an existing tool named "Pricking Iron" (slug: pricking-iron).
+	seedIndex(t, idx, "tool", "pricking-iron")
+
+	// POST a second tool with the same name — should get slug "pricking-iron-2".
+	resp := postJSON(t, srv, "/api/primitives",
+		`{"type":"tool","name":"Pricking Iron"}`)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var p apiPrimitive
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if p.Slug != "pricking-iron-2" {
+		t.Errorf("Slug: got %q, want %q", p.Slug, "pricking-iron-2")
+	}
+	if p.Path != "tools/pricking-iron-2/manifest.json" {
+		t.Errorf("Path: got %q, want %q", p.Path, "tools/pricking-iron-2/manifest.json")
+	}
+	// Name must remain unchanged — only the slug changes.
+	if p.Name != "Pricking Iron" {
+		t.Errorf("Name: got %q, want %q (name must not change)", p.Name, "Pricking Iron")
+	}
+}
+
+func TestCreatePrimitive_AutoSlug_SkipsOccupiedSuffix(t *testing.T) {
+	srv, idx := newWriteServer(t)
+	defer srv.Close()
+
+	// Occupy both the base slug and -2.
+	seedIndex(t, idx, "tool", "pricking-iron")
+	seedIndex(t, idx, "tool", "pricking-iron-2")
+
+	// Third create should land on -3.
+	resp := postJSON(t, srv, "/api/primitives",
+		`{"type":"tool","name":"Pricking Iron"}`)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var p apiPrimitive
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if p.Slug != "pricking-iron-3" {
+		t.Errorf("Slug: got %q, want %q", p.Slug, "pricking-iron-3")
+	}
+}
+
+func TestCreatePrimitive_ExplicitSlug_Collision_Returns409(t *testing.T) {
+	srv, idx := newWriteServer(t)
+	defer srv.Close()
+
+	seedIndex(t, idx, "tool", "my-chisel")
+
+	resp := postJSON(t, srv, "/api/primitives",
+		`{"type":"tool","name":"My Chisel","slug":"my-chisel"}`)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("expected 409, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+func TestCreatePrimitive_ExplicitSlug_Free_Succeeds(t *testing.T) {
+	srv, _ := newWriteServer(t)
+	defer srv.Close()
+
+	// No pre-existing entry — explicit slug should be accepted as-is.
+	resp := postJSON(t, srv, "/api/primitives",
+		`{"type":"tool","name":"My Chisel","slug":"my-chisel"}`)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var p apiPrimitive
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if p.Slug != "my-chisel" {
+		t.Errorf("Slug: got %q, want %q", p.Slug, "my-chisel")
+	}
+}
+
+func TestCreatePrimitive_SameSlugDifferentTypes_NoConflict(t *testing.T) {
+	srv, idx := newWriteServer(t)
+	defer srv.Close()
+
+	// A tool already exists at tools/foo/manifest.json.
+	seedIndex(t, idx, "tool", "foo")
+
+	// Creating a material named "Foo" derives slug "foo", but the path
+	// materials/foo/manifest.json is distinct — no conflict.
+	resp := postJSON(t, srv, "/api/primitives",
+		`{"type":"material","name":"Foo"}`)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d\n%s", resp.StatusCode, readBody(t, resp))
+	}
+
+	var p apiPrimitive
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if p.Slug != "foo" {
+		t.Errorf("Slug: got %q, want %q (different type = different path, no suffix needed)", p.Slug, "foo")
+	}
+	if p.Path != "materials/foo/manifest.json" {
+		t.Errorf("Path: got %q, want %q", p.Path, "materials/foo/manifest.json")
 	}
 }

@@ -413,6 +413,39 @@ func TestConcurrentWrites(t *testing.T) {
 // TestConcurrentReadWrite verifies that reads and writes interleave safely.
 // Writers upsert; readers call List concurrently. No SQLITE_BUSY or panic
 // should occur.
+// — Exists ————————————————————————————————————————————————————————————————————
+
+func TestExists_AbsentThenPresent(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	const path = "tools/test-tool/manifest.json"
+
+	// Not yet inserted — must be false.
+	exists, err := idx.Exists(ctx, path)
+	if err != nil {
+		t.Fatalf("Exists (absent): %v", err)
+	}
+	if exists {
+		t.Error("Exists: expected false for absent path, got true")
+	}
+
+	// Insert it.
+	p := testPrimitive("t-001", "tool", "Test Tool", "test-tool", path)
+	if err := idx.UpsertFull(ctx, p, nil); err != nil {
+		t.Fatalf("UpsertFull: %v", err)
+	}
+
+	// Now must be true.
+	exists, err = idx.Exists(ctx, path)
+	if err != nil {
+		t.Fatalf("Exists (present): %v", err)
+	}
+	if !exists {
+		t.Error("Exists: expected true for present path, got false")
+	}
+}
+
 func TestConcurrentReadWrite(t *testing.T) {
 	idx := openMemory(t)
 	ctx := context.Background()

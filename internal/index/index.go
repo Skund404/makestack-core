@@ -261,6 +261,15 @@ func (idx *Index) Get(ctx context.Context, path string) (*Primitive, error) {
 	return p, err
 }
 
+// Exists reports whether a primitive with the given path is present in the index.
+func (idx *Index) Exists(ctx context.Context, path string) (bool, error) {
+	p, err := idx.Get(ctx, path)
+	if err != nil {
+		return false, err
+	}
+	return p != nil, nil
+}
+
 // Search performs a full-text search across name, description, tags, and
 // properties using FTS5. Returns matching primitives ordered by name.
 func (idx *Index) Search(ctx context.Context, query string) ([]Primitive, error) {

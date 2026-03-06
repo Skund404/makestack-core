@@ -29,6 +29,17 @@ var validPrimitiveTypes = map[string]bool{
 // digits, or hyphens, used to sanitise a name into a URL-safe slug.
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
 
+// BuildPrimitivePath constructs the canonical path for a primitive.
+// origin is "" for v0.1 (single-repo). In v0.2 federation it becomes the
+// repo's declared origin name, prefixing the path so that the same bare slug
+// can coexist across multiple roots without collision.
+func BuildPrimitivePath(origin, primType, slug string) string {
+	if origin == "" {
+		return primType + "s/" + slug + "/manifest.json"
+	}
+	return origin + "/" + primType + "s/" + slug + "/manifest.json"
+}
+
 // Server is the makestack-core REST API server.
 type Server struct {
 	mux         *http.ServeMux
@@ -430,6 +441,13 @@ func (s *Server) handleRelationships(w http.ResponseWriter, r *http.Request) {
 // Optional auto-generation: id (UUID v4 if absent), slug (derived from name
 // if absent), created and modified (set to current UTC time).
 //
+// Slug collision handling:
+//   - If the caller did not supply "slug", the slug is derived from "name".
+//     If the resulting path already exists in the index, a numeric suffix is
+//     appended (-2, -3, … up to -100) until a free path is found.
+//   - If the caller supplied an explicit "slug" and it already exists, the
+//     request is rejected with 409 Conflict so the caller retains control.
+//
 // The file is written to {type}s/{slug}/manifest.json relative to the data
 // directory and immediately committed to Git. The watcher will pick up the
 // change and update the index asynchronously.
@@ -463,10 +481,15 @@ func (s *Server) handleCreatePrimitive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// — auto-generate missing optional fields —————————————————————————————
+
+	// Capture whether the caller explicitly supplied a slug before we
+	// auto-generate one — the collision policy differs between the two cases.
+	explicitSlug := jsonString(body["slug"]) != ""
+
 	if jsonString(body["id"]) == "" {
 		body["id"] = jsonRaw(generateID())
 	}
-	if jsonString(body["slug"]) == "" {
+	if !explicitSlug {
 		body["slug"] = jsonRaw(slugify(name))
 	}
 
@@ -476,13 +499,60 @@ func (s *Server) handleCreatePrimitive(w http.ResponseWriter, r *http.Request) {
 	}
 	body["modified"] = jsonRaw(now)
 
-	slug := jsonString(body["slug"])
-
 	// — validate structure ————————————————————————————————————————————————
 	if errs := schema.Validate(primType, body); len(errs) > 0 {
 		writeError(w, http.StatusBadRequest,
 			fmt.Errorf("validation failed: %s", strings.Join(errs, "; ")))
 		return
+	}
+
+	// — resolve slug, checking for path collisions in the index ——————————
+	baseSlug := jsonString(body["slug"])
+	slug := baseSlug
+	relPath := BuildPrimitivePath("", primType, slug)
+
+	if explicitSlug {
+		// Caller controls the slug — check once and reject if already taken.
+		exists, err := s.idx.Exists(r.Context(), relPath)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if exists {
+			writeError(w, http.StatusConflict,
+				fmt.Errorf("slug %q already taken; choose a different slug", slug))
+			return
+		}
+	} else {
+		// Auto-generated slug — walk -2, -3, … until a free path is found.
+		exists, err := s.idx.Exists(r.Context(), relPath)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if exists {
+			found := false
+			for n := 2; n <= 100; n++ {
+				slug = fmt.Sprintf("%s-%d", baseSlug, n)
+				relPath = BuildPrimitivePath("", primType, slug)
+				ex, err := s.idx.Exists(r.Context(), relPath)
+				if err != nil {
+					writeError(w, http.StatusInternalServerError, err)
+					return
+				}
+				if !ex {
+					found = true
+					break
+				}
+			}
+			if !found {
+				writeError(w, http.StatusConflict,
+					fmt.Errorf("slug %q: all suffixes up to -100 are taken", baseSlug))
+				return
+			}
+			// Record the de-duplicated slug in the manifest body before marshal.
+			body["slug"] = jsonRaw(slug)
+		}
 	}
 
 	// — write to disk and commit ——————————————————————————————————————————
@@ -492,8 +562,6 @@ func (s *Server) handleCreatePrimitive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Canonical path: {type}s/{slug}/manifest.json
-	relPath := primType + "s/" + slug + "/manifest.json"
 	commitMsg := fmt.Sprintf("create %s: %s", primType, name)
 
 	if err := s.writer.WriteManifest(relPath, data, commitMsg); err != nil {
