@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	gitpkg "github.com/makestack/makestack-core/internal/git"
 	_ "modernc.org/sqlite" // register the sqlite driver (pure Go, no CGO)
@@ -30,7 +31,12 @@ var schemaStmts = []string{
 		properties     TEXT,
 		parent_project TEXT,
 		manifest       TEXT NOT NULL,
-		root_slug      TEXT NOT NULL DEFAULT 'primary'
+		root_slug      TEXT NOT NULL DEFAULT 'primary',
+		domain         TEXT NOT NULL DEFAULT '',
+		unit           TEXT NOT NULL DEFAULT '',
+		subtype        TEXT NOT NULL DEFAULT '',
+		occurred_at    TEXT NOT NULL DEFAULT '',
+		status         TEXT NOT NULL DEFAULT ''
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS relationships (
@@ -47,15 +53,17 @@ var schemaStmts = []string{
 
 	// Content table FTS — actual content lives in primitives; the FTS index
 	// stores only the search tokens. Rebuild with the 'rebuild' command.
-	// root_slug is included so full-text search can find primitives by root.
+	// root_slug and domain are included so full-text search spans those fields.
 	`CREATE VIRTUAL TABLE IF NOT EXISTS primitives_fts USING fts5(
-		name, description, tags, properties, root_slug,
+		name, description, tags, properties, root_slug, domain,
 		content=primitives, content_rowid=rowid
 	)`,
 
 	`CREATE INDEX IF NOT EXISTS idx_primitives_type      ON primitives(type)`,
 	`CREATE INDEX IF NOT EXISTS idx_primitives_parent    ON primitives(parent_project)`,
 	`CREATE INDEX IF NOT EXISTS idx_primitives_root      ON primitives(root_slug)`,
+	`CREATE INDEX IF NOT EXISTS idx_primitives_domain    ON primitives(domain)`,
+	`CREATE INDEX IF NOT EXISTS idx_primitives_status    ON primitives(status)`,
 	`CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_path)`,
 	`CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_path)`,
 	`CREATE INDEX IF NOT EXISTS idx_relationships_type   ON relationships(relationship_type)`,
@@ -79,6 +87,12 @@ type Primitive struct {
 	ParentProject string
 	Manifest      json.RawMessage // complete original manifest
 	RootSlug      string          // slug of the root this primitive belongs to
+	// Primitives Evolution fields (Core-1, additive).
+	Domain     string // domain pack affiliation
+	Unit       string // unit of measure (material)
+	Subtype    string // material subtype
+	OccurredAt string // ISO8601 timestamp (event)
+	Status     string // lifecycle status (project)
 }
 
 // Relationship holds a single row from the relationships table.
@@ -160,8 +174,9 @@ func (idx *Index) UpsertFull(ctx context.Context, p Primitive, rels []Relationsh
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO primitives
 			(id, type, name, slug, path, created, modified, description,
-			 tags, cloned_from, properties, parent_project, manifest, root_slug)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 tags, cloned_from, properties, parent_project, manifest, root_slug,
+			 domain, unit, subtype, occurred_at, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
 			id=excluded.id, type=excluded.type, name=excluded.name,
 			slug=excluded.slug, created=excluded.created,
@@ -170,10 +185,14 @@ func (idx *Index) UpsertFull(ctx context.Context, p Primitive, rels []Relationsh
 			properties=excluded.properties,
 			parent_project=excluded.parent_project,
 			manifest=excluded.manifest,
-			root_slug=excluded.root_slug`,
+			root_slug=excluded.root_slug,
+			domain=excluded.domain, unit=excluded.unit,
+			subtype=excluded.subtype, occurred_at=excluded.occurred_at,
+			status=excluded.status`,
 		p.ID, p.Type, p.Name, p.Slug, p.Path, p.Created, p.Modified,
 		p.Description, tagsStr, p.ClonedFrom, propsStr, p.ParentProject,
 		string(p.Manifest), rootSlug,
+		p.Domain, p.Unit, p.Subtype, p.OccurredAt, p.Status,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert primitive %s: %w", p.Path, err)
@@ -234,35 +253,48 @@ func (idx *Index) RebuildFTS(ctx context.Context) error {
 	return err
 }
 
-// List returns primitives ordered by type then name.
-// typeFilter and rootFilter are both optional — pass "" to skip that filter.
-func (idx *Index) List(ctx context.Context, typeFilter, rootFilter string) ([]Primitive, error) {
-	const cols = `id, type, name, slug, path, created, modified,
-	              description, tags, cloned_from, properties, parent_project, manifest, root_slug`
+// primitiveColumns is the shared SELECT column list for the primitives table.
+// The order here must exactly match the scan order in scanPrimitive.
+const primitiveColumns = `id, type, name, slug, path, created, modified,
+	              description, tags, cloned_from, properties, parent_project, manifest, root_slug,
+	              domain, unit, subtype, occurred_at, status`
 
-	var (
-		rows *sql.Rows
-		err  error
-	)
+// List returns primitives, optionally filtered by type, root, domain, and/or
+// status. All four filters are optional — pass "" to skip a given filter.
+// Results are ordered by name when a type filter is active, otherwise by
+// type then name.
+func (idx *Index) List(ctx context.Context, typeFilter, rootFilter, domainFilter, statusFilter string) ([]Primitive, error) {
+	var conditions []string
+	var args []interface{}
 
-	switch {
-	case typeFilter != "" && rootFilter != "":
-		rows, err = idx.db.QueryContext(ctx,
-			`SELECT `+cols+` FROM primitives WHERE type = ? AND root_slug = ? ORDER BY name`,
-			typeFilter, rootFilter)
-	case typeFilter != "":
-		rows, err = idx.db.QueryContext(ctx,
-			`SELECT `+cols+` FROM primitives WHERE type = ? ORDER BY name`,
-			typeFilter)
-	case rootFilter != "":
-		rows, err = idx.db.QueryContext(ctx,
-			`SELECT `+cols+` FROM primitives WHERE root_slug = ? ORDER BY type, name`,
-			rootFilter)
-	default:
-		rows, err = idx.db.QueryContext(ctx,
-			`SELECT `+cols+` FROM primitives ORDER BY type, name`)
+	if typeFilter != "" {
+		conditions = append(conditions, "type = ?")
+		args = append(args, typeFilter)
+	}
+	if rootFilter != "" {
+		conditions = append(conditions, "root_slug = ?")
+		args = append(args, rootFilter)
+	}
+	if domainFilter != "" {
+		conditions = append(conditions, "domain = ?")
+		args = append(args, domainFilter)
+	}
+	if statusFilter != "" {
+		conditions = append(conditions, "status = ?")
+		args = append(args, statusFilter)
 	}
 
+	q := `SELECT ` + primitiveColumns + ` FROM primitives`
+	if len(conditions) > 0 {
+		q += ` WHERE ` + strings.Join(conditions, ` AND `)
+	}
+	if typeFilter != "" {
+		q += ` ORDER BY name`
+	} else {
+		q += ` ORDER BY type, name`
+	}
+
+	rows, err := idx.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list primitives: %w", err)
 	}
@@ -273,11 +305,8 @@ func (idx *Index) List(ctx context.Context, typeFilter, rootFilter string) ([]Pr
 
 // Get returns the primitive with the given path, or nil if it does not exist.
 func (idx *Index) Get(ctx context.Context, path string) (*Primitive, error) {
-	row := idx.db.QueryRowContext(ctx, `
-		SELECT id, type, name, slug, path, created, modified,
-		       description, tags, cloned_from, properties, parent_project, manifest, root_slug
-		FROM primitives
-		WHERE path = ?`,
+	row := idx.db.QueryRowContext(ctx,
+		`SELECT `+primitiveColumns+` FROM primitives WHERE path = ?`,
 		path)
 
 	p, err := scanPrimitive(row)
@@ -297,12 +326,13 @@ func (idx *Index) Exists(ctx context.Context, path string) (bool, error) {
 }
 
 // Search performs a full-text search across name, description, tags,
-// properties, and root_slug using FTS5. Returns matching primitives ordered
-// by name.
+// properties, root_slug, and domain using FTS5. Returns matching primitives
+// ordered by name.
 func (idx *Index) Search(ctx context.Context, query string) ([]Primitive, error) {
 	rows, err := idx.db.QueryContext(ctx, `
 		SELECT p.id, p.type, p.name, p.slug, p.path, p.created, p.modified,
-		       p.description, p.tags, p.cloned_from, p.properties, p.parent_project, p.manifest, p.root_slug
+		       p.description, p.tags, p.cloned_from, p.properties, p.parent_project, p.manifest, p.root_slug,
+		       p.domain, p.unit, p.subtype, p.occurred_at, p.status
 		FROM primitives p
 		WHERE p.rowid IN (
 			SELECT rowid FROM primitives_fts WHERE primitives_fts MATCH ?
@@ -363,6 +393,11 @@ func primitiveFrom(pm *gitpkg.ParsedManifest) Primitive {
 		ParentProject: pm.ParentProject,
 		Properties:    pm.Properties,
 		Manifest:      pm.Raw,
+		Domain:        pm.Domain,
+		Unit:          pm.Unit,
+		Subtype:       pm.Subtype,
+		OccurredAt:    pm.OccurredAt,
+		Status:        pm.Status,
 	}
 	if len(pm.Tags) > 0 {
 		if b, err := json.Marshal(pm.Tags); err == nil {
@@ -420,6 +455,7 @@ func scanPrimitive(s rowScanner) (*Primitive, error) {
 		&p.ID, &p.Type, &p.Name, &p.Slug, &p.Path,
 		&p.Created, &p.Modified, &p.Description,
 		&tags, &p.ClonedFrom, &props, &p.ParentProject, &manifest, &p.RootSlug,
+		&p.Domain, &p.Unit, &p.Subtype, &p.OccurredAt, &p.Status,
 	)
 	if err != nil {
 		return nil, err
@@ -479,37 +515,58 @@ func (idx *Index) CountByRoot(ctx context.Context) (map[string]int, error) {
 // — Schema migration ———————————————————————————————————————————————————————————
 
 // migrate runs idempotent schema migrations for databases created before
-// root_slug was added. Safe to call on every startup — it checks column
-// existence before altering.
+// optional columns were added. Safe to call on every startup — it checks
+// column existence before altering.
 func migrate(db *sql.DB) error {
-	// Add root_slug to primitives if it was created without it.
+	// — v0.2 migration: add root_slug ——————————————————————————————————————
 	if !hasColumn(db, "primitives", "root_slug") {
 		if _, err := db.Exec(
 			`ALTER TABLE primitives ADD COLUMN root_slug TEXT NOT NULL DEFAULT 'primary'`,
 		); err != nil {
 			return fmt.Errorf("add root_slug to primitives: %w", err)
 		}
-		// The FTS virtual table references primitives columns. Drop it so the
-		// schema statement recreates it with root_slug on the next Open call.
+		// The FTS virtual table references primitives columns. Drop and
+		// recreate it so the updated column list takes effect.
 		// RebuildFTS (called by the bulk loader) will repopulate it.
 		if _, err := db.Exec(`DROP TABLE IF EXISTS primitives_fts`); err != nil {
 			return fmt.Errorf("drop primitives_fts for migration: %w", err)
 		}
-		// Recreate FTS with updated column list.
 		if _, err := db.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS primitives_fts USING fts5(
-			name, description, tags, properties, root_slug,
+			name, description, tags, properties, root_slug, domain,
 			content=primitives, content_rowid=rowid
 		)`); err != nil {
 			return fmt.Errorf("recreate primitives_fts: %w", err)
 		}
 	}
 
-	// Add root_slug to relationships if it was created without it.
 	if !hasColumn(db, "relationships", "root_slug") {
 		if _, err := db.Exec(
 			`ALTER TABLE relationships ADD COLUMN root_slug TEXT NOT NULL DEFAULT 'primary'`,
 		); err != nil {
 			return fmt.Errorf("add root_slug to relationships: %w", err)
+		}
+	}
+
+	// — Core-1 migration: add Primitives Evolution fields ——————————————————
+	// Check domain as the representative; if it's missing all five new
+	// columns are absent (they were introduced together).
+	if !hasColumn(db, "primitives", "domain") {
+		for _, col := range []string{"domain", "unit", "subtype", "occurred_at", "status"} {
+			if _, err := db.Exec(
+				`ALTER TABLE primitives ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`,
+			); err != nil {
+				return fmt.Errorf("add %s to primitives: %w", col, err)
+			}
+		}
+		// Drop and recreate FTS to include domain in the search index.
+		if _, err := db.Exec(`DROP TABLE IF EXISTS primitives_fts`); err != nil {
+			return fmt.Errorf("drop primitives_fts for Core-1 migration: %w", err)
+		}
+		if _, err := db.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS primitives_fts USING fts5(
+			name, description, tags, properties, root_slug, domain,
+			content=primitives, content_rowid=rowid
+		)`); err != nil {
+			return fmt.Errorf("recreate primitives_fts after Core-1 migration: %w", err)
 		}
 	}
 

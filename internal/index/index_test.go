@@ -221,7 +221,7 @@ func TestList_NoFilter_ReturnsAll(t *testing.T) {
 	_ = idx.UpsertFull(ctx, testPrimitive("2", "material", "M", "m", "materials/m/manifest.json"), nil)
 	_ = idx.UpsertFull(ctx, testPrimitive("3", "technique","X", "x", "techniques/x/manifest.json"),nil)
 
-	all, err := idx.List(ctx, "", "")
+	all, err := idx.List(ctx, "", "", "", "")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestList_TypeFilter_ReturnsSubset(t *testing.T) {
 	_ = idx.UpsertFull(ctx, testPrimitive("2", "tool",     "T2", "t2", "tools/t2/manifest.json"),   nil)
 	_ = idx.UpsertFull(ctx, testPrimitive("3", "material", "M",  "m",  "materials/m/manifest.json"),nil)
 
-	tools, err := idx.List(ctx, "tool", "")
+	tools, err := idx.List(ctx, "tool", "", "", "")
 	if err != nil {
 		t.Fatalf("List(tool): %v", err)
 	}
@@ -430,7 +430,7 @@ func TestList_RootFilter_ReturnsOnlyMatchingRoot(t *testing.T) {
 	_ = idx.UpsertFull(ctx, p1, nil)
 	_ = idx.UpsertFull(ctx, p2, nil)
 
-	got, err := idx.List(ctx, "", "supplier")
+	got, err := idx.List(ctx, "", "supplier", "", "")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -457,7 +457,7 @@ func TestList_TypeAndRootFilter_Combined(t *testing.T) {
 	_ = idx.UpsertFull(ctx, p2, nil)
 	_ = idx.UpsertFull(ctx, p3, nil)
 
-	got, err := idx.List(ctx, "tool", "supplier")
+	got, err := idx.List(ctx, "tool", "supplier", "", "")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -548,6 +548,128 @@ func TestExists_AbsentThenPresent(t *testing.T) {
 	}
 }
 
+// — Core-1: domain, unit, subtype, occurred_at, status ———————————————————————
+
+func TestDomainField_RoundTrip(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	p := testPrimitive("m-001", "material", "Veg Tan Leather", "veg-tan-leather", "materials/veg-tan-leather/manifest.json")
+	p.Domain = "leathercraft"
+	p.Unit = "sq ft"
+	p.Subtype = "consumable"
+
+	if err := idx.UpsertFull(ctx, p, nil); err != nil {
+		t.Fatalf("UpsertFull: %v", err)
+	}
+
+	got, err := idx.Get(ctx, p.Path)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Domain != "leathercraft" {
+		t.Errorf("Domain: got %q, want %q", got.Domain, "leathercraft")
+	}
+	if got.Unit != "sq ft" {
+		t.Errorf("Unit: got %q, want %q", got.Unit, "sq ft")
+	}
+	if got.Subtype != "consumable" {
+		t.Errorf("Subtype: got %q, want %q", got.Subtype, "consumable")
+	}
+}
+
+func TestStatusField_RoundTrip(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	p := testPrimitive("proj-001", "project", "Bifold Wallet", "bifold-wallet", "projects/bifold-wallet/manifest.json")
+	p.Status = "active"
+
+	if err := idx.UpsertFull(ctx, p, nil); err != nil {
+		t.Fatalf("UpsertFull: %v", err)
+	}
+
+	got, err := idx.Get(ctx, p.Path)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "active" {
+		t.Errorf("Status: got %q, want %q", got.Status, "active")
+	}
+}
+
+func TestList_DomainFilter(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	p1 := testPrimitive("1", "material", "Leather", "leather", "materials/leather/manifest.json")
+	p1.Domain = "leathercraft"
+	p2 := testPrimitive("2", "material", "Fabric", "fabric", "materials/fabric/manifest.json")
+	p2.Domain = "sewing"
+	p3 := testPrimitive("3", "tool", "Needle", "needle", "tools/needle/manifest.json")
+	// no domain
+
+	_ = idx.UpsertFull(ctx, p1, nil)
+	_ = idx.UpsertFull(ctx, p2, nil)
+	_ = idx.UpsertFull(ctx, p3, nil)
+
+	got, err := idx.List(ctx, "", "", "leathercraft", "")
+	if err != nil {
+		t.Fatalf("List(domain=leathercraft): %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 leathercraft primitive, got %d", len(got))
+	}
+	if got[0].ID != "1" {
+		t.Errorf("unexpected ID %q, want %q", got[0].ID, "1")
+	}
+}
+
+func TestList_StatusFilter(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	p1 := testPrimitive("1", "project", "Wallet", "wallet", "projects/wallet/manifest.json")
+	p1.Status = "active"
+	p2 := testPrimitive("2", "project", "Belt", "belt", "projects/belt/manifest.json")
+	p2.Status = "planned"
+	p3 := testPrimitive("3", "project", "Bag", "bag", "projects/bag/manifest.json")
+	p3.Status = "active"
+
+	_ = idx.UpsertFull(ctx, p1, nil)
+	_ = idx.UpsertFull(ctx, p2, nil)
+	_ = idx.UpsertFull(ctx, p3, nil)
+
+	got, err := idx.List(ctx, "", "", "", "active")
+	if err != nil {
+		t.Fatalf("List(status=active): %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 active projects, got %d", len(got))
+	}
+}
+
+func TestList_ExistingPrimitives_EmptyNewFields(t *testing.T) {
+	idx := openMemory(t)
+	ctx := context.Background()
+
+	// Primitive without any new fields — all new fields should be empty strings.
+	p := testPrimitive("x-001", "tool", "Old Tool", "old-tool", "tools/old-tool/manifest.json")
+
+	if err := idx.UpsertFull(ctx, p, nil); err != nil {
+		t.Fatalf("UpsertFull: %v", err)
+	}
+
+	got, err := idx.Get(ctx, p.Path)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Domain != "" || got.Unit != "" || got.Subtype != "" || got.OccurredAt != "" || got.Status != "" {
+		t.Errorf("expected all new fields to be empty for primitive without them, got domain=%q unit=%q subtype=%q occurred_at=%q status=%q",
+			got.Domain, got.Unit, got.Subtype, got.OccurredAt, got.Status)
+	}
+}
+
 func TestConcurrentReadWrite(t *testing.T) {
 	idx := openMemory(t)
 	ctx := context.Background()
@@ -579,7 +701,7 @@ func TestConcurrentReadWrite(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := idx.List(ctx, "", ""); err != nil {
+			if _, err := idx.List(ctx, "", "", "", ""); err != nil {
 				errs <- fmt.Errorf("reader %d: %w", i, err)
 			}
 		}()

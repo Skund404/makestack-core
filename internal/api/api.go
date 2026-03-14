@@ -135,12 +135,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleListPrimitives handles GET /api/primitives[?type=<type>][?root=<slug>].
+// handleListPrimitives handles GET /api/primitives[?type=<type>][?root=<slug>][?domain=<domain>][?status=<status>].
 func (s *Server) handleListPrimitives(w http.ResponseWriter, r *http.Request) {
-	typeFilter := r.URL.Query().Get("type")
-	rootFilter := r.URL.Query().Get("root")
+	typeFilter   := r.URL.Query().Get("type")
+	rootFilter   := r.URL.Query().Get("root")
+	domainFilter := r.URL.Query().Get("domain")
+	statusFilter := r.URL.Query().Get("status")
 
-	primitives, err := s.idx.List(r.Context(), typeFilter, rootFilter)
+	primitives, err := s.idx.List(r.Context(), typeFilter, rootFilter, domainFilter, statusFilter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -821,10 +823,16 @@ type apiPrimitive struct {
 	Tags          json.RawMessage `json:"tags"`
 	Properties    json.RawMessage `json:"properties,omitempty"`
 	ParentProject string          `json:"parent_project,omitempty"`
+	// Primitives Evolution fields (Core-1, additive).
+	Domain     string `json:"domain,omitempty"`
+	Unit       string `json:"unit,omitempty"`
+	Subtype    string `json:"subtype,omitempty"`
+	OccurredAt string `json:"occurred_at,omitempty"`
+	Status     string `json:"status,omitempty"`
 	Manifest      json.RawMessage `json:"manifest"`
 	// CommitHash is the Git commit hash this primitive was read from.
 	// Only set when the request used the ?at= query parameter.
-	CommitHash    string          `json:"commit_hash,omitempty"`
+	CommitHash string `json:"commit_hash,omitempty"`
 }
 
 // apiRelationship is the JSON shape returned for a single relationship row.
@@ -852,6 +860,11 @@ func toAPIPrimitive(p index.Primitive) apiPrimitive {
 		Tags:          p.Tags,
 		Properties:    p.Properties,
 		ParentProject: p.ParentProject,
+		Domain:        p.Domain,
+		Unit:          p.Unit,
+		Subtype:       p.Subtype,
+		OccurredAt:    p.OccurredAt,
+		Status:        p.Status,
 		Manifest:      p.Manifest,
 	}
 }
@@ -878,6 +891,11 @@ func parsedToAPI(pm *gitpkg.ParsedManifest) apiPrimitive {
 		Tags:          tags,
 		Properties:    pm.Properties,
 		ParentProject: pm.ParentProject,
+		Domain:        pm.Domain,
+		Unit:          pm.Unit,
+		Subtype:       pm.Subtype,
+		OccurredAt:    pm.OccurredAt,
+		Status:        pm.Status,
 		Manifest:      pm.Raw,
 	}
 }

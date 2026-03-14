@@ -45,6 +45,13 @@ type ParsedManifest struct {
 	ClonedFrom    string
 	ParentProject string
 
+	// Optional Primitives Evolution fields (Core-1, additive).
+	Domain     string // domain pack affiliation (any string, not enforced)
+	Unit       string // unit of measure for material primitives (any string)
+	Subtype    string // material subtype: consumable, component, product, organism
+	OccurredAt string // ISO8601 timestamp for event primitives
+	Status     string // lifecycle status for project primitives
+
 	// Relationships declared in this manifest.
 	Relationships []Relationship
 
@@ -67,6 +74,12 @@ type rawManifest struct {
 	ClonedFrom    string          `json:"cloned_from"`
 	ParentProject string          `json:"parent_project"`
 	Relationships []Relationship  `json:"relationships"`
+	// Primitives Evolution fields (Core-1, additive).
+	Domain     string `json:"domain,omitempty"`
+	Unit       string `json:"unit,omitempty"`
+	Subtype    string `json:"subtype,omitempty"`
+	OccurredAt string `json:"occurred_at,omitempty"`
+	Status     string `json:"status,omitempty"`
 }
 
 // Manifest is a raw (unparsed) manifest read from disk.
@@ -114,6 +127,11 @@ func (m Manifest) Parse() (*ParsedManifest, error) {
 		ClonedFrom:    raw.ClonedFrom,
 		ParentProject: raw.ParentProject,
 		Relationships: raw.Relationships,
+		Domain:        raw.Domain,
+		Unit:          raw.Unit,
+		Subtype:       raw.Subtype,
+		OccurredAt:    raw.OccurredAt,
+		Status:        raw.Status,
 		Raw:           m.Raw,
 	}, nil
 }
