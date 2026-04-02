@@ -111,8 +111,10 @@ makestack-data/
 │   └── {slug}/manifest.json
 ├── projects/
 │   └── {slug}/manifest.json
-└── events/
-    └── {slug}/manifest.json
+├── events/
+│   └── {slug}/manifest.json
+└── binary-refs/
+    └── {slug}/ref.json          # Binary file pointer records (not indexed as primitives)
 ```
 
 The `.makestack/` directory holds configuration files and is not indexed as primitives.
@@ -420,6 +422,79 @@ DELETE /api/primitives/{path}/manifest.json
 ```
 
 Removes the manifest from the data repo and commits the deletion. Returns `204 No Content`. Returns `400` if the path belongs to a federated (non-primary) root.
+
+---
+
+### Fork Primitive
+
+```
+POST /api/primitives/{path}/manifest.json/fork
+Content-Type: application/json
+
+{ "name": "My Variation", "description": "Optional description override" }
+```
+
+Creates an independent copy of an existing primitive. The new primitive:
+- Gets a new UUID, new slug (`{original-slug}-fork`, de-duplicated), and fresh timestamps
+- Has `cloned_from` set to the source path
+- Copies the `relationships` array as-is (edit after forking if needed)
+- Optional `name` and `description` fields in the request body override the source values
+
+Returns `201` with the full new manifest. All writes target the primary root only.
+
+The `cloned_from` field is included in all primitive responses (`""` if the primitive is not a fork).
+
+---
+
+### Binary File References
+
+```
+GET    /api/binary-refs                    List all binary refs
+GET    /api/binary-refs?asset_type=photo   Filter by asset type
+GET    /api/binary-refs?primitive_ref=...  Filter by linked primitive path
+GET    /api/binary-refs/{slug}             Get one ref
+POST   /api/binary-refs                    Create a ref
+PUT    /api/binary-refs/{slug}             Update a ref
+DELETE /api/binary-refs/{slug}             Delete a ref
+```
+
+Binary file references are git-backed pointer records that describe binary files (photos, videos, 3D models, documents, etc.) without storing the files themselves — no LFS required. Stored at `binary-refs/{slug}/ref.json` in the primary data repo.
+
+**Fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | UUID (auto-generated) |
+| `slug` | string | URL-safe identifier (auto-generated, de-duplicated) |
+| `filename` | string | Original filename |
+| `mime_type` | string | MIME type (e.g. `image/jpeg`) |
+| `size_bytes` | int | File size in bytes |
+| `sha256` | string | SHA-256 hash of the file for integrity checks |
+| `local_path` | string | Absolute path on the local filesystem |
+| `backup_location` | string | Remote backup URI (e.g. `s3://bucket/path/file.jpg`) |
+| `asset_type` | string | Semantic type: `photo`, `video`, `model`, `document`, etc. |
+| `description` | string | Human-readable description |
+| `tags` | array | String tags for search and filtering |
+| `primitive_ref` | string | Optional path to a linked catalogue primitive |
+| `created` / `modified` | string | ISO 8601 timestamps (auto-managed) |
+
+**Example: attach a reference photo to a project**
+
+```json
+{
+  "filename": "main-photo.jpg",
+  "mime_type": "image/jpeg",
+  "sha256": "abc123...",
+  "local_path": "/home/user/photos/main-photo.jpg",
+  "backup_location": "s3://my-bucket/makestack/main-photo.jpg",
+  "asset_type": "photo",
+  "description": "Main reference photo for the project",
+  "tags": ["reference", "photo"],
+  "primitive_ref": "projects/my-leatherwork-bag/manifest.json"
+}
+```
+
+Returns `201` with the full record including auto-generated `id`, `slug`, `created`, `modified`.
 
 ---
 

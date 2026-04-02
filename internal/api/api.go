@@ -105,8 +105,16 @@ func (s *Server) registerRoutes() {
 
 	// Write — primitives (always protected regardless of --public-reads).
 	s.mux.HandleFunc("POST /api/primitives", s.withAuth(s.handleCreatePrimitive))
+	s.mux.HandleFunc("POST /api/primitives/{path...}", s.withAuth(s.handlePrimitiveSubresourcePost))
 	s.mux.HandleFunc("PUT /api/primitives/{path...}", s.withAuth(s.handleUpdatePrimitive))
 	s.mux.HandleFunc("DELETE /api/primitives/{path...}", s.withAuth(s.handleDeletePrimitive))
+
+	// Binary file references (git-backed pointer files for binary assets).
+	s.mux.HandleFunc("GET /api/binary-refs", readAuth(s.handleListBinaryRefs))
+	s.mux.HandleFunc("POST /api/binary-refs", s.withAuth(s.handleCreateBinaryRef))
+	s.mux.HandleFunc("GET /api/binary-refs/{slug}", readAuth(s.handleGetBinaryRef))
+	s.mux.HandleFunc("PUT /api/binary-refs/{slug}", s.withAuth(s.handleUpdateBinaryRef))
+	s.mux.HandleFunc("DELETE /api/binary-refs/{slug}", s.withAuth(s.handleDeleteBinaryRef))
 
 	// Search and relationships.
 	s.mux.HandleFunc("GET /api/search", readAuth(s.handleSearch))
@@ -735,6 +743,141 @@ func (s *Server) handleDeletePrimitive(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// — fork handler ——————————————————————————————————————————————————————————————
+
+// handlePrimitiveSubresourcePost routes POST /api/primitives/{path...} to the
+// appropriate sub-resource handler based on the path suffix.
+// Go 1.22 mux does not support {wildcard}/literal patterns, so suffix
+// detection mirrors the approach used on GET (see handleGetPrimitive).
+func (s *Server) handlePrimitiveSubresourcePost(w http.ResponseWriter, r *http.Request) {
+	path := r.PathValue("path")
+	if strings.HasSuffix(path, "/fork") {
+		s.handleForkPrimitive(w, r, strings.TrimSuffix(path, "/fork"))
+		return
+	}
+	writeError(w, http.StatusNotFound, fmt.Errorf("unknown sub-resource: %s", path))
+}
+
+// handleForkPrimitive handles POST /api/primitives/{path...}/fork.
+//
+// Creates a new independent copy of the primitive at path, setting
+// cloned_from to the source path for provenance tracking. The forked
+// primitive gets a new id, new slug ({original-slug}-fork, de-duplicated),
+// and fresh timestamps. All other fields (tags, properties, relationships,
+// steps, etc.) are copied verbatim from the source.
+//
+// Optional request body (application/json):
+//
+//	{"name": "...", "description": "..."}
+//
+// When name is omitted, the fork is named "{original name} (fork)".
+// Returns 201 with the new primitive.
+func (s *Server) handleForkPrimitive(w http.ResponseWriter, r *http.Request, sourcePath string) {
+	if !s.writerReady(w) {
+		return
+	}
+
+	// Load the source primitive from the index.
+	src, err := s.idx.Get(r.Context(), sourcePath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if src == nil {
+		writeError(w, http.StatusNotFound, fmt.Errorf("not found: %s", sourcePath))
+		return
+	}
+
+	// Guard: can only fork from the primary root.
+	if s.fedConfig != nil && src.RootSlug != "primary" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"cannot fork from federated root %q: forking is restricted to the primary root",
+			src.RootSlug))
+		return
+	}
+
+	// Start from a copy of the source manifest JSON.
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(src.Manifest, &body); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("parse source manifest: %w", err))
+		return
+	}
+
+	// Parse optional overrides from the request body. A missing or empty body
+	// is fine — all fields have sensible defaults.
+	var overrides struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	// Ignore decode errors; empty body or non-JSON body means no overrides.
+	json.NewDecoder(r.Body).Decode(&overrides) //nolint:errcheck
+
+	// Record provenance.
+	body["cloned_from"] = jsonRaw(sourcePath)
+
+	// Apply name override or default fork name.
+	srcName := jsonString(body["name"])
+	if overrides.Name != "" {
+		body["name"] = jsonRaw(overrides.Name)
+	} else {
+		body["name"] = jsonRaw(srcName + " (fork)")
+	}
+	if overrides.Description != "" {
+		body["description"] = jsonRaw(overrides.Description)
+	}
+
+	// Generate a new unique identity.
+	body["id"] = jsonRaw(generateID())
+
+	primType := jsonString(body["type"])
+	srcSlug := jsonString(body["slug"])
+	baseSlug := srcSlug + "-fork"
+	slug := baseSlug
+	newPath := BuildPrimitivePath("", primType, slug)
+
+	// De-duplicate the slug if needed.
+	for n := 2; n <= 100; n++ {
+		exists, err := s.idx.Exists(r.Context(), newPath)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if !exists {
+			break
+		}
+		slug = fmt.Sprintf("%s-%d", baseSlug, n)
+		newPath = BuildPrimitivePath("", primType, slug)
+	}
+	body["slug"] = jsonRaw(slug)
+
+	// Stamp fresh timestamps.
+	now := time.Now().UTC().Format(time.RFC3339)
+	body["created"] = jsonRaw(now)
+	body["modified"] = jsonRaw(now)
+
+	// Write and commit.
+	data, err := json.MarshalIndent(body, "", "  ")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("marshal forked manifest: %w", err))
+		return
+	}
+
+	forkName := jsonString(body["name"])
+	commitMsg := fmt.Sprintf("fork %s: %s (from %s)", primType, forkName, srcName)
+	if err := s.writer.WriteManifest(newPath, data, commitMsg); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("write forked manifest: %w", err))
+		return
+	}
+
+	m := gitpkg.Manifest{Path: newPath, Raw: json.RawMessage(data)}
+	pm, err := m.Parse()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("parse forked manifest: %w", err))
+		return
+	}
+	writeJSON(w, http.StatusCreated, parsedToAPI(pm))
+}
+
 // — federation handlers ———————————————————————————————————————————————————————
 
 // apiRoot is the JSON shape returned for a single root in /api/roots.
@@ -822,6 +965,7 @@ type apiPrimitive struct {
 	Description   string          `json:"description,omitempty"`
 	Tags          json.RawMessage `json:"tags"`
 	Properties    json.RawMessage `json:"properties,omitempty"`
+	ClonedFrom    string          `json:"cloned_from,omitempty"`
 	ParentProject string          `json:"parent_project,omitempty"`
 	// Primitives Evolution fields (Core-1, additive).
 	Domain     string `json:"domain,omitempty"`
@@ -829,7 +973,7 @@ type apiPrimitive struct {
 	Subtype    string `json:"subtype,omitempty"`
 	OccurredAt string `json:"occurred_at,omitempty"`
 	Status     string `json:"status,omitempty"`
-	Manifest      json.RawMessage `json:"manifest"`
+	Manifest   json.RawMessage `json:"manifest"`
 	// CommitHash is the Git commit hash this primitive was read from.
 	// Only set when the request used the ?at= query parameter.
 	CommitHash string `json:"commit_hash,omitempty"`
@@ -859,6 +1003,7 @@ func toAPIPrimitive(p index.Primitive) apiPrimitive {
 		Description:   p.Description,
 		Tags:          p.Tags,
 		Properties:    p.Properties,
+		ClonedFrom:    p.ClonedFrom,
 		ParentProject: p.ParentProject,
 		Domain:        p.Domain,
 		Unit:          p.Unit,
@@ -890,6 +1035,7 @@ func parsedToAPI(pm *gitpkg.ParsedManifest) apiPrimitive {
 		Description:   pm.Description,
 		Tags:          tags,
 		Properties:    pm.Properties,
+		ClonedFrom:    pm.ClonedFrom,
 		ParentProject: pm.ParentProject,
 		Domain:        pm.Domain,
 		Unit:          pm.Unit,

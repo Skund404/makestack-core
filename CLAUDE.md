@@ -130,11 +130,39 @@ makestack-data/
 │   └── {slug}/manifest.json
 ├── workflows/
 │   └── {slug}/manifest.json
-└── events/
-    └── {slug}/manifest.json
+├── events/
+│   └── {slug}/manifest.json
+└── binary-refs/
+    └── {slug}/ref.json          # Binary file pointer records (not indexed as primitives)
 ```
 
 ### SQLite Index Schema
+
+Binary refs use a separate table (`binary_refs`) not part of the primitives schema:
+
+```sql
+CREATE TABLE binary_refs (
+    id              TEXT PRIMARY KEY,
+    slug            TEXT NOT NULL UNIQUE,
+    filename        TEXT NOT NULL,
+    mime_type       TEXT,
+    size_bytes      INTEGER,
+    sha256          TEXT,
+    local_path      TEXT,
+    backup_location TEXT,
+    asset_type      TEXT,
+    description     TEXT,
+    tags            TEXT,           -- JSON array
+    primitive_ref   TEXT,           -- optional path to a primitive
+    created         TEXT NOT NULL,
+    modified        TEXT NOT NULL,
+    raw             TEXT NOT NULL   -- full JSON
+);
+CREATE INDEX idx_binary_refs_asset_type ON binary_refs(asset_type);
+CREATE INDEX idx_binary_refs_primitive_ref ON binary_refs(primitive_ref);
+```
+
+Primitives schema:
 
 ```sql
 CREATE TABLE primitives (
@@ -187,8 +215,10 @@ makestack-core/
 │       └── main.go              # Entry point
 ├── internal/
 │   ├── git/                     # Git operations (go-git)
-│   ├── index/                   # SQLite indexer
-│   ├── api/                     # REST API handlers
+│   ├── index/                   # SQLite indexer (primitives + binary_refs)
+│   ├── api/
+│   │   ├── api.go               # REST API handlers (primitives, fork, routing)
+│   │   └── binary_refs.go       # Binary file reference handlers (NEW)
 │   ├── auth/                    # Authentication
 │   ├── schema/                  # JSON schema validation
 │   └── watcher/                 # File system watcher
@@ -245,15 +275,17 @@ The full specs are in the makestack-docs repo. Key documents for Core developmen
 
 ## Current State
 
-Core: **FEATURE COMPLETE FOR v0.2**
+Core: **FEATURE COMPLETE FOR v0.2 + post-v0.2 additions**
 
 - [x] Go module initialized (`github.com/makestack/makestack-core`)
 - [x] Project structure created
 - [x] Git operations: read — `internal/git`: walks data dir, reads all `manifest.json` files, parses typed fields, validates required fields, extracts relationships
-- [x] Git operations: write — `internal/git/writer.go`: WriteManifest + DeleteManifest, auto-commits via go-git
-- [x] SQLite indexer — `internal/index`: full schema (primitives, relationships, FTS5), `UpsertFull` (atomic tx), `Delete`, `List`, `Get`, `Search`, `RelationshipsFor`, `RebuildFTS`
+- [x] Git operations: write — `internal/git/writer.go`: WriteManifest + DeleteManifest, auto-commits via go-git; reused for binary-refs at `binary-refs/{slug}/ref.json`
+- [x] SQLite indexer — `internal/index`: full schema (primitives, relationships, FTS5, binary_refs), `UpsertFull` (atomic tx), `Delete`, `List`, `Get`, `Search`, `RelationshipsFor`, `RebuildFTS`; binary-ref methods: `UpsertBinaryRef`, `GetBinaryRef`, `BinaryRefExists`, `ListBinaryRefs`, `DeleteBinaryRef`
 - [x] REST API read — `GET /health`, `GET /api/primitives[?type=]`, `GET /api/primitives/{path...}[?at={hash}]`, `GET /api/primitives/{path...}/hash`, `GET /api/primitives/{path...}/history[?limit=&offset=]`, `GET /api/primitives/{path...}/diff[?from=&to=]`, `GET /api/search?q=`, `GET /api/relationships/{path...}`
 - [x] REST API write — `POST /api/primitives` (create, auto id/slug/timestamps), `PUT /api/primitives/{path...}` (update), `DELETE /api/primitives/{path...}` (delete)
+- [x] **Fork** — `POST /api/primitives/{path...}/fork` — copies a primitive to a new slug, sets `cloned_from`, accepts optional name/description overrides; `cloned_from` returned in all primitive API responses
+- [x] **Binary file references** — `GET/POST/PUT/DELETE /api/binary-refs` — git-backed pointer system for binary files (photos, models, documents) without LFS; stored at `binary-refs/{slug}/ref.json`; indexed synchronously in `binary_refs` SQLite table
 - [x] Full-text search (FTS5) — indexes name, description, tags, properties
 - [x] Relationship indexing + reverse lookups — `RelationshipsFor` returns both directions
 - [x] File watcher — `internal/watcher`: fsnotify v1.9.0, recursive dir watching, 200 ms debounce, handles create/edit/delete live; recursively processes new dirs to avoid race with write API
@@ -282,6 +314,37 @@ Core: **FEATURE COMPLETE FOR v0.2**
 ## What's In Progress
 
 Nothing currently in progress.
+
+---
+
+## Post-v0.2 API Reference
+
+### Fork Primitive
+
+```
+POST /api/primitives/{path.../manifest.json}/fork
+Content-Type: application/json
+
+{ "name": "My Variation", "description": "Optional override" }
+```
+
+Copies the primitive to a new slug (`{original}-fork`, de-duplicated). Sets `cloned_from` to the source path. Accepts optional `name` and `description` overrides. Returns `201` with the new manifest. Routing note: Go 1.22 mux does not support `{path...}/suffix` patterns; the fork handler is dispatched via `strings.HasSuffix` inside a wildcard `POST /api/primitives/{path...}` handler.
+
+The `cloned_from` field is now included in all primitive API responses (empty string if not a fork).
+
+### Binary File References
+
+```
+GET    /api/binary-refs                         List refs (filter: asset_type, primitive_ref)
+GET    /api/binary-refs/{slug}                  Get one ref
+POST   /api/binary-refs                         Create ref (auto id/slug/timestamps)
+PUT    /api/binary-refs/{slug}                  Update ref
+DELETE /api/binary-refs/{slug}                  Delete ref
+```
+
+Binary refs are git-backed pointer records stored at `binary-refs/{slug}/ref.json`. They track binary file metadata without storing the file itself — no LFS required. Fields: `id`, `slug`, `filename`, `mime_type`, `size_bytes`, `sha256`, `local_path`, `backup_location`, `asset_type`, `description`, `tags` (array), `primitive_ref` (optional path to a catalogue primitive), `created`, `modified`.
+
+Unlike primitives, binary refs are indexed **synchronously** on create/update/delete (not via the watcher). The watcher only watches the primitive directories.
 
 ---
 
@@ -467,6 +530,16 @@ PUT and DELETE to paths in non-primary roots return `400 Bad Request` with a cle
 - Added write guards (400) for PUT/DELETE on non-primary root primitives
 - All existing tests pass; 15 new integration tests added across `internal/api`, `internal/index`, `internal/parser`, `internal/federation`
 - `go test -race ./...` — all packages green
+
+### 2026-04-02 — Fork + Binary File References
+
+- Added `POST /api/primitives/{path...}` wildcard handler for sub-resource POSTs; dispatches to `handleForkPrimitive` via `strings.HasSuffix(path, "/fork")` (same suffix-routing pattern as `/history`, `/diff`, `/hash`)
+- `handleForkPrimitive`: loads source primitive, parses manifest JSON, applies optional name/description overrides, generates new UUID + slug (`{src}-fork`, de-duplicated), sets `cloned_from = sourcePath`, stamps new timestamps, calls `writer.WriteManifest`, returns 201
+- Added `cloned_from` field to `apiPrimitive` struct, `toAPIPrimitive()`, `parsedToAPI()` — included in all primitive responses
+- New file `internal/api/binary_refs.go`: `apiBinaryRef` struct, `buildBinaryRefPath`, 5 handlers (`handleListBinaryRefs`, `handleGetBinaryRef`, `handleCreateBinaryRef`, `handleUpdateBinaryRef`, `handleDeleteBinaryRef`), `parseBinaryRefBody`, `toBinaryRefAPI`
+- Binary refs stored at `binary-refs/{slug}/ref.json`, reusing `writer.WriteManifest`/`DeleteManifest`; indexed synchronously via `idx.UpsertBinaryRef` (not the watcher)
+- Added `binary_refs` SQLite table + indexes (`idx_binary_refs_asset_type`, `idx_binary_refs_primitive_ref`) to `schemaStmts` in `internal/index/index.go`; added `BinaryRef` struct, `UpsertBinaryRef`, `GetBinaryRef`, `BinaryRefExists`, `ListBinaryRefs`, `DeleteBinaryRef`, `scanBinaryRef` methods
+- Registered 5 binary-refs routes in `setupRoutes()`
 
 ### 2026-03-01 — Version-Specific Primitive Retrieval
 - Added `internal/git/history.go`: `ReadManifestAtCommit(path, commitHash)` reads a manifest from the Git object store at any past commit; `HeadHash()` returns the current HEAD hash as a 40-char hex string; `ErrNotFound` sentinel (wraps `plumbing.ErrObjectNotFound` / `object.ErrFileNotFound`) so callers don't import go-git plumbing packages

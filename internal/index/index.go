@@ -14,6 +14,27 @@ import (
 	_ "modernc.org/sqlite" // register the sqlite driver (pure Go, no CGO)
 )
 
+// BinaryRef holds all indexed fields for a single binary file reference.
+// Binary refs are pointer records that describe where a binary asset lives
+// (local path, backup location) without storing the file in Git.
+type BinaryRef struct {
+	ID             string
+	Slug           string
+	Filename       string
+	MimeType       string
+	SizeBytes      int64
+	SHA256         string
+	LocalPath      string
+	BackupLocation string
+	AssetType      string
+	Description    string
+	Tags           []string
+	PrimitiveRef   string // optional path to a catalogue primitive
+	Created        string
+	Modified       string
+	Raw            json.RawMessage // complete original JSON
+}
+
 // schemaStmts are executed in order on Open to create tables and indexes.
 // Splitting into individual statements avoids driver multi-statement quirks.
 var schemaStmts = []string{
@@ -67,6 +88,27 @@ var schemaStmts = []string{
 	`CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_path)`,
 	`CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_path)`,
 	`CREATE INDEX IF NOT EXISTS idx_relationships_type   ON relationships(relationship_type)`,
+
+	// binary_refs — pointer records for binary assets stored outside the repo.
+	`CREATE TABLE IF NOT EXISTS binary_refs (
+		id              TEXT PRIMARY KEY,
+		slug            TEXT NOT NULL UNIQUE,
+		filename        TEXT NOT NULL,
+		mime_type       TEXT NOT NULL DEFAULT '',
+		size_bytes      INTEGER NOT NULL DEFAULT 0,
+		sha256          TEXT NOT NULL DEFAULT '',
+		local_path      TEXT NOT NULL DEFAULT '',
+		backup_location TEXT NOT NULL DEFAULT '',
+		asset_type      TEXT NOT NULL DEFAULT '',
+		description     TEXT NOT NULL DEFAULT '',
+		tags            TEXT NOT NULL DEFAULT '[]',
+		primitive_ref   TEXT NOT NULL DEFAULT '',
+		created         TEXT NOT NULL,
+		modified        TEXT NOT NULL,
+		raw             TEXT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_binary_refs_asset_type   ON binary_refs(asset_type)`,
+	`CREATE INDEX IF NOT EXISTS idx_binary_refs_primitive_ref ON binary_refs(primitive_ref)`,
 }
 
 // Primitive holds all indexed fields for a single makestack primitive.
@@ -571,6 +613,118 @@ func migrate(db *sql.DB) error {
 	}
 
 	return nil
+}
+
+// — binary ref methods ————————————————————————————————————————————————————————
+
+// UpsertBinaryRef inserts or updates a binary ref row.
+func (idx *Index) UpsertBinaryRef(ctx context.Context, r BinaryRef) error {
+	tagsJSON, _ := json.Marshal(r.Tags)
+	rawStr := string(r.Raw)
+	if rawStr == "" {
+		rawStr = "{}"
+	}
+	_, err := idx.db.ExecContext(ctx, `
+		INSERT INTO binary_refs
+			(id, slug, filename, mime_type, size_bytes, sha256, local_path,
+			 backup_location, asset_type, description, tags, primitive_ref,
+			 created, modified, raw)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET
+			slug=excluded.slug, filename=excluded.filename,
+			mime_type=excluded.mime_type, size_bytes=excluded.size_bytes,
+			sha256=excluded.sha256, local_path=excluded.local_path,
+			backup_location=excluded.backup_location,
+			asset_type=excluded.asset_type, description=excluded.description,
+			tags=excluded.tags, primitive_ref=excluded.primitive_ref,
+			modified=excluded.modified, raw=excluded.raw`,
+		r.ID, r.Slug, r.Filename, r.MimeType, r.SizeBytes, r.SHA256,
+		r.LocalPath, r.BackupLocation, r.AssetType, r.Description,
+		string(tagsJSON), r.PrimitiveRef, r.Created, r.Modified, rawStr,
+	)
+	return err
+}
+
+// GetBinaryRef returns the binary ref with the given slug, or nil if not found.
+func (idx *Index) GetBinaryRef(ctx context.Context, slug string) (*BinaryRef, error) {
+	row := idx.db.QueryRowContext(ctx,
+		`SELECT id, slug, filename, mime_type, size_bytes, sha256, local_path,
+		        backup_location, asset_type, description, tags, primitive_ref,
+		        created, modified, raw
+		 FROM binary_refs WHERE slug = ?`, slug)
+	ref, err := scanBinaryRef(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return ref, err
+}
+
+// BinaryRefExists reports whether a binary ref with the given slug exists.
+func (idx *Index) BinaryRefExists(ctx context.Context, slug string) (bool, error) {
+	ref, err := idx.GetBinaryRef(ctx, slug)
+	return ref != nil, err
+}
+
+// ListBinaryRefs returns all binary refs, optionally filtered by asset_type
+// and/or primitive_ref. Pass "" to skip a filter.
+func (idx *Index) ListBinaryRefs(ctx context.Context, assetType, primitiveRef string) ([]BinaryRef, error) {
+	q := `SELECT id, slug, filename, mime_type, size_bytes, sha256, local_path,
+	             backup_location, asset_type, description, tags, primitive_ref,
+	             created, modified, raw
+	      FROM binary_refs`
+	var conditions []string
+	var args []interface{}
+	if assetType != "" {
+		conditions = append(conditions, "asset_type = ?")
+		args = append(args, assetType)
+	}
+	if primitiveRef != "" {
+		conditions = append(conditions, "primitive_ref = ?")
+		args = append(args, primitiveRef)
+	}
+	if len(conditions) > 0 {
+		q += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	q += " ORDER BY filename"
+
+	rows, err := idx.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list binary refs: %w", err)
+	}
+	defer rows.Close()
+
+	var result []BinaryRef
+	for rows.Next() {
+		ref, err := scanBinaryRef(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *ref)
+	}
+	return result, rows.Err()
+}
+
+// DeleteBinaryRef removes the binary ref with the given slug from the index.
+func (idx *Index) DeleteBinaryRef(ctx context.Context, slug string) error {
+	_, err := idx.db.ExecContext(ctx, `DELETE FROM binary_refs WHERE slug = ?`, slug)
+	return err
+}
+
+func scanBinaryRef(s rowScanner) (*BinaryRef, error) {
+	var ref BinaryRef
+	var tagsStr, rawStr string
+	err := s.Scan(
+		&ref.ID, &ref.Slug, &ref.Filename, &ref.MimeType, &ref.SizeBytes,
+		&ref.SHA256, &ref.LocalPath, &ref.BackupLocation, &ref.AssetType,
+		&ref.Description, &tagsStr, &ref.PrimitiveRef, &ref.Created,
+		&ref.Modified, &rawStr,
+	)
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal([]byte(tagsStr), &ref.Tags) //nolint:errcheck
+	ref.Raw = json.RawMessage(rawStr)
+	return &ref, nil
 }
 
 // hasColumn reports whether the given table has a column with the given name.
